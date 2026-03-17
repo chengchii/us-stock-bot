@@ -1,12 +1,12 @@
 import os
 import discord
-from discord.ext import commands
+from discord.ext import commands,tasks
 import yfinance as yf
 import pandas as pd
 import asyncio
 import json
 import requests
-from datetime import datetime
+from datetime import datetime,timedelta,time,timezone
 import traceback
 import matplotlib
 matplotlib.use('Agg') 
@@ -335,9 +335,35 @@ async def on_message(message):
     await bot.process_commands(message)
 
 @bot.event
+# ==========================================
+# 🌟 內建每日自動掃描鬧鐘
+# ==========================================
+# 設定執行時間：UTC 22:00 = 台灣時間早上 06:00
+scan_time = time(hour=22, minute=0, tzinfo=timezone.utc)
+
+@tasks.loop(time=scan_time)
+async def daily_scan_task():
+    # 台灣時間早上 6 點時，檢查今天是不是星期二到星期六 
+    # (因為美股週一到週五的收盤，對應到台灣是週二到週六的清晨)
+    # weekday() 回傳值: 0=週一, 1=週二 ... 5=週六, 6=週日
+    today_weekday = datetime.now().weekday()
+    
+    if 1 <= today_weekday <= 5:
+        channel = bot.get_channel(int(CHANNEL_ID))
+        if channel:
+            await channel.send("🌅 **【早安華爾街】** 美股已收盤，系統自動啟動每日晨間掃描...")
+        await perform_scan(force_send=True)
+    else:
+        print("週末休市，今日不執行自動掃描。")
+@bot.event
 async def on_ready():
     print(f"🦅 US Bot Online: {bot.user}")
-    keep_alive()
+    keep_alive() # 啟動假網頁讓 UptimeRobot 監控
+    
+    # 🌟 啟動每日掃描鬧鐘
+    if not daily_scan_task.is_running():
+        daily_scan_task.start()
+        print("⏰ 每日晨間掃描鬧鐘已啟動 (排定於台灣時間 06:00)")
 
 if __name__ == "__main__":
     bot.run(DISCORD_BOT_TOKEN)
