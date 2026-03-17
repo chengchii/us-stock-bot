@@ -42,24 +42,45 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # ==========================================
 # 2. 美股百大旗艦觀察名單
 # ==========================================
-STOCK_NAMES = {
-    "AAPL": "蘋果 (Apple)", "MSFT": "微軟 (Microsoft)", "NVDA": "輝達 (Nvidia)", 
-    "GOOGL": "谷歌 (Alphabet)", "AMZN": "亞馬遜 (Amazon)", "META": "Meta", 
-    "TSLA": "特斯拉 (Tesla)", "AMD": "超微 (AMD)", "TSM": "台積電ADR", 
-    "AVGO": "博通 (Broadcom)", "QCOM": "高通 (Qualcomm)", "INTC": "英特爾 (Intel)", 
-    "ASML": "艾司摩爾 (ASML)", "MU": "美光 (Micron)", "ARM": "安謀 (ARM)",
-    "PLTR": "帕蘭泰爾", "SMCI": "美超微", "CRM": "賽富時", "ADBE": "奧多比", 
-    "NFLX": "網飛 (Netflix)", "NOW": "ServiceNow", "UBER": "優步 (Uber)", 
-    "CRWD": "眾擊", "PANW": "Palo Alto", "SNOW": "Snowflake", "SPOT": "Spotify",
-    "BRK-B": "波克夏", "JPM": "摩根大通", "V": "Visa", "MA": "萬事達卡", 
-    "BAC": "美國銀行", "GS": "高盛", "COIN": "Coinbase", "MSTR": "微策略",
-    "LLY": "禮來", "UNH": "聯合健康", "JNJ": "嬌生", "WMT": "沃爾瑪", 
-    "COST": "好市多", "PG": "寶僑", "KO": "可口可樂", "PEP": "百事", 
-    "MCD": "麥當勞", "NKE": "Nike", "DIS": "迪士尼", "BA": "波音",
-    "SPY": "標普500 ETF", "QQQ": "納斯達克 ETF", "DIA": "道瓊 ETF",
-    "SMH": "半導體 ETF", "SOXX": "費半 ETF", "ARKK": "木頭姐 ETF"
-}
-WATCHLIST = list(STOCK_NAMES.keys())
+# ==========================================
+# 2. 自動抓取 NASDAQ 100 最新成分股名單
+# ==========================================
+def get_nasdaq_100_tickers():
+    try:
+        print("🌐 正在從維基百科下載最新的 NASDAQ 100 成分股名單...")
+        # 維基百科的 NASDAQ 100 頁面
+        url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+        # pandas 內建的超強爬蟲，可以直接抓網頁裡的表格
+        tables = pd.read_html(url)
+        
+        # NASDAQ 100 的成分股通常在維基百科頁面的第 4 個表格 (索引是 4，不過有時候會變)
+        # 為了保險，我們寫個迴圈找一下哪個表格有 'Ticker' 欄位
+        for table in tables:
+            if 'Ticker' in table.columns:
+                df = table
+                break
+        
+        # 把 Ticker 欄位抽出來變成名單
+        tickers = df['Ticker'].tolist()
+        
+        # 建立一個簡單的字典，因為維基百科上只有公司英文全名，有點長，我們這裡就簡單用代號當名稱
+        names_dict = {}
+        for idx, row in df.iterrows():
+            sym = row['Ticker']
+            # 取公司名稱的前面幾個字就好，以免太長
+            name = str(row['Company']).split()[0].replace(',', '')
+            names_dict[sym] = name
+            
+        return tickers, names_dict
+    except Exception as e:
+        print(f"❌ 抓取 NASDAQ 100 名單失敗: {e}")
+        # 如果爬蟲失敗（例如維基百科改版），給一個超精簡的備用名單保底
+        backup_list = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"]
+        return backup_list, {s: s for s in backup_list}
+
+# 在程式啟動時，自動執行一次抓取
+WATCHLIST, STOCK_NAMES = get_nasdaq_100_tickers()
+print(f"✅ 成功載入 {len(WATCHLIST)} 檔 NASDAQ 100 股票！")
 
 # ==========================================
 # 3. 虛擬帳本系統
