@@ -334,7 +334,6 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-@bot.event
 # ==========================================
 # 🌟 內建每日自動掃描鬧鐘
 # ==========================================
