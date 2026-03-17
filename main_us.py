@@ -50,8 +50,9 @@ def get_nasdaq_100_tickers():
         print("🌐 正在從維基百科下載最新的 NASDAQ 100 成分股名單...")
         # 維基百科的 NASDAQ 100 頁面
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
-        # pandas 內建的超強爬蟲，可以直接抓網頁裡的表格
-        tables = pd.read_html(url)
+        # 用我們偽裝成 Chrome 瀏覽器的 session 去跟維基百科要資料
+        html_data = session.get(url, timeout=10).text 
+        tables = pd.read_html(html_data)
         
         # NASDAQ 100 的成分股通常在維基百科頁面的第 4 個表格 (索引是 4，不過有時候會變)
         # 為了保險，我們寫個迴圈找一下哪個表格有 'Ticker' 欄位
