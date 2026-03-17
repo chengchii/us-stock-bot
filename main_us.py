@@ -101,16 +101,37 @@ def save_portfolio(p):
 # ==========================================
 # 4. YFinance 數據引擎
 # ==========================================
-async def fetch_single_stock_data(symbol, retries=2):
+# ==========================================
+# 4. YFinance 數據引擎 (強化版)
+# ==========================================
+async def fetch_single_stock_data(symbol, retries=3):
     loop = asyncio.get_running_loop()
     for attempt in range(retries):
         try:
-            df = await loop.run_in_executor(None, lambda: yf.Ticker(symbol, session=session).history(period="1y"))
+            # 放棄使用 session，改用 yf.download()，這在雲端環境通常更穩定
+            def download_data():
+                # 抓取過去 1 年的資料
+                data = yf.download(symbol, period="1y", progress=False)
+                return data
+
+            df = await loop.run_in_executor(None, download_data)
+            
             if not df.empty and len(df) > 0:
-                return symbol, df
+                # yf.download 回傳的欄位可能是 MultiIndex，我們需要稍微處理一下
+                if isinstance(df.columns, pd.MultiIndex):
+                    # 如果是多重索引，只取 Close 價格，並且確保欄位名稱正確
+                    close_series = df['Close'][symbol] if symbol in df['Close'] else df['Close']
+                    
+                    # 重新組裝出一個符合我們原本格式的 DataFrame
+                    new_df = pd.DataFrame(index=df.index)
+                    new_df['Close'] = close_series
+                    return symbol, new_df
+                else:
+                    return symbol, df
         except Exception as e:
-            pass
-        await asyncio.sleep(1)
+            print(f"DEBUG: 抓取 {symbol} 失敗 (嘗試 {attempt+1}/{retries}): {e}")
+            
+        await asyncio.sleep(2) # 失敗的話等 2 秒再試
     return symbol, pd.DataFrame()
 
 # ==========================================
