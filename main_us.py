@@ -228,6 +228,9 @@ async def process_stock_query(channel, symbol):
 # ==========================================
 # 7. 美股自動掃描引擎 (SPY 大盤 + 零股均分 + 全列表顯示)
 # ==========================================
+# ==========================================
+# 7. 華爾街 AI 多因子評分掃描引擎 (Quant Multi-Factor Model) + 零股自動佈局
+# ==========================================
 async def perform_scan(force_send=False):
     channel = bot.get_channel(int(CHANNEL_ID))
     if not channel: return
@@ -235,13 +238,14 @@ async def perform_scan(force_send=False):
     p = load_portfolio()
     msg_lines = []
     
+    # 🏦 入金邏輯
     curr_month = datetime.now().strftime("%Y-%m")
     if p.get("last_month", "") != curr_month:
         p["cash"] = p.get("cash", 0.0) + INVEST_AMOUNT
         p["last_month"] = curr_month
-        msg_lines.append(f"🏦 **美股入金**：已存入 ${INVEST_AMOUNT} USD，現金：`${p['cash']:.2f}`")
+        msg_lines.append(f"🏦 **美股入金**：已存入 ${INVEST_AMOUNT} USD，現金餘額：`${p['cash']:.2f}`")
 
-    # 判定大盤 (SPY)
+    # 🛡️ 大盤判定邏輯 (SPY)
     _, df_market = await fetch_single_stock_data("SPY")
     if df_market.empty:
         msg_lines.append("⚠️ 警告：無法取得 SPY 數據，保護機制啟動，暫停買進。")
@@ -253,41 +257,114 @@ async def perform_scan(force_send=False):
             msg_lines.append("🛑 **【美股警報】** S&P 500 (SPY) 跌破季線。空頭市場嚴禁做多！")
 
     results = []
+    
+    # 🔍 如果大盤偏多，啟動 AI 掃描
     if is_bull_market:
-        scan_msg = await channel.send("🦅 美股大盤偏多！正在掃描 50+ 檔旗艦股，這大約需要 1~2 分鐘...")
+        scan_msg = await channel.send("🦅 美股大盤偏多！啟動「華爾街 AI 多因子評分模型」掃描 NASDAQ 100 強 (約需 1~2 分鐘)...")
+        
         for s in WATCHLIST:
             _, df = await fetch_single_stock_data(s)
             if df.empty or len(df) < 200: continue
             
-            close = df['Close']
-            ema200 = close.ewm(span=200, adjust=False).mean()
-            macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-            sig = macd.ewm(span=9, adjust=False).mean()
-            
-            # 策略：站上 200EMA + 零軸下金叉
-            if (close.iloc[-1] > ema200.iloc[-1]) and (macd.iloc[-2] < sig.iloc[-2]) and (macd.iloc[-1] > sig.iloc[-1]) and (macd.iloc[-1] < 0):
-                score = macd.iloc[-1] - sig.iloc[-1] # MACD 快慢線差值，越大代表動能越強
-                results.append({'symbol': s, 'price': close.iloc[-1], 'score': score})
+            try:
+                close = df['Close']
+                vol = df['Volume']
+                
+                # --- 因子計算區 ---
+                ema200 = close.ewm(span=200, adjust=False).mean()
+                macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+                sig = macd.ewm(span=9, adjust=False).mean()
+                
+                delta = close.diff()
+                up = delta.clip(lower=0)
+                down = -1 * delta.clip(upper=0)
+                rsi = 100 - (100 / (1 + up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()))
+                
+                ma20 = close.rolling(window=20).mean()
+                std20 = close.rolling(window=20).std()
+                upper_bb = ma20 + (2 * std20)
+                vol_ma20 = vol.rolling(window=20).mean()
+
+                # --- 取得最新一日數據 ---
+                c_price = close.iloc[-1]
+                c_macd = macd.iloc[-1]
+                c_sig = sig.iloc[-1]
+                c_rsi = rsi.iloc[-1]
+                c_vol = vol.iloc[-1]
+                c_vol_ma20 = vol_ma20.iloc[-1]
+
+                # =======================================
+                # 🧠 華爾街 AI 評分核心邏輯 (滿分 100)
+                # =======================================
+                score = 0
+                badges = []
+
+                # 【因子 1】趨勢與動能 (Max 35)
+                if c_price > ema200.iloc[-1]: score += 15
+                if c_macd > c_sig: score += 10
+                if c_macd > 0: score += 10 
+
+                # 【因子 2】聰明錢主力動能 (Max 30)
+                vol_ratio = c_vol / c_vol_ma20 if c_vol_ma20 > 0 else 0
+                vol_score = min(30, int(vol_ratio * 10)) 
+                score += vol_score
+                if vol_score >= 20: badges.append("🔥機構爆量") # 美股用語改為機構
+
+                # 【因子 3】爆發力道 (Max 20)
+                if c_price > upper_bb.iloc[-1]:
+                    score += 20
+                    badges.append("🌋突破壓力")
+                elif c_price > ma20.iloc[-1]:
+                    score += 10 
+
+                # 【因子 4】時機與風險懲罰 (Max 15)
+                if 55 <= c_rsi <= 65:
+                    score += 15
+                    badges.append("🎯完美時機")
+                elif 50 < c_rsi < 55 or 65 < c_rsi <= 70:
+                    score += 10
+                elif c_rsi > 70:
+                    score += 5 
+                    badges.append("⚠️留意追高")
+
+                # --- 嚴格初選：總分 >= 60 且 MACD 金叉 ---
+                if score >= 60 and c_macd > c_sig:
+                    results.append({
+                        'symbol': s,
+                        'name': STOCK_NAMES.get(s, s),
+                        'price': c_price,
+                        'score': score,
+                        'vol_ratio': vol_ratio,
+                        'badges': badges
+                    })
+            except Exception as e:
+                continue
+                
             await asyncio.sleep(0.5)
             
         try: await scan_msg.delete()
         except: pass
 
-        # 🌟 排序並列出「所有」符合條件的股票
-        results.sort(key=lambda x: x['score'], reverse=True)
-        
+        # --- 排序與輸出報告 ---
         if results:
-            msg_lines.append(f"\n🎯 **【零軸下黃金交叉清單】** (共 {len(results)} 檔)")
+            results.sort(key=lambda x: (x['score'], x['vol_ratio']), reverse=True)
+            
+            msg_lines.append(f"\n🤖 **【AI 多因子量化選股報告】** (篩選出 {len(results)} 檔美股科技巨獸)")
+            msg_lines.append("`量化維度：趨勢動能(35%) + 機構籌碼(30%) + 突破爆發(20%) + 風險時機(15%)`\n")
+            
             for idx, r in enumerate(results):
-                sym = r['symbol']
-                name = STOCK_NAMES.get(sym, sym)
-                # 前三名給予火炬圖示強烈推薦
-                rec_icon = "🔥 強烈推薦" if idx < 3 else "✅ 符合標準"
-                msg_lines.append(f"`{idx+1}.` **{sym}** ({name}) - 股價: `${r['price']:.2f}` | 評級: {rec_icon}")
+                if idx >= 10: break # 只顯示前 10 名
+                
+                rank_icon = "👑" if idx == 0 else ("🥈" if idx == 1 else ("🥉" if idx == 2 else "🔹"))
+                badge_str = " ".join(r['badges']) if r['badges'] else "溫和上漲"
+                
+                msg_lines.append(f"{rank_icon} **Top {idx+1}: {r['symbol']} ({r['name']})**")
+                msg_lines.append(f"> 📊 綜合評分: **`{r['score']}分`** (現價 `${r['price']:.2f}`) | 成交量達均量 `{r['vol_ratio']:.1f}倍`")
+                msg_lines.append(f"> 🏷️ AI 標籤: {badge_str}\n")
         else:
-            msg_lines.append("🔎 巡邏完畢，目前 **無任何一檔** 符合 MACD 買進訊號。")
+            msg_lines.append("\n🔎 AI 巡邏完畢，目前 NASDAQ 100 資金動能不足，無任何股票達到 60 分及格線。")
 
-    # 持股停利損檢查
+    # 💼 持股停利損檢查 (與之前相同)
     for sym, data_p in list(p.get("holdings", {}).items()):
         _, df = await fetch_single_stock_data(sym)
         if df.empty: continue
@@ -303,15 +380,17 @@ async def perform_scan(force_send=False):
             msg_lines.append(f"🚨 **自動平倉**：{name} 賣出價 `${curr_p:.2f}` (報酬率 `{profit_pct:.1f}%`)")
             del p["holdings"][sym]
 
-    # 🌟 執行買進：將資金均分給「所有」符合條件的股票 (零股交易)
-    if results and p.get("cash", 0) > 10: # 只要現金大於 10 美金就繼續買
-        budget = p["cash"] / len(results) # 資金均分給所有標的
-        msg_lines.append(f"\n🛒 **【自動佈局 (零股)】** 預計每檔分配約 `${budget:.2f}`")
+    # 🛒 執行買進：將資金均分給「AI 評分及格」的股票 (零股交易)
+    if is_bull_market and results and p.get("cash", 0) > 10: 
+        # 決定要買幾檔：最多買前 5 名 (分散風險)
+        buy_targets = results[:5] 
+        budget = p["cash"] / len(buy_targets) 
+        msg_lines.append(f"\n🛒 **【AI 自動佈局 (零股)】** 預計每檔分配約 `${budget:.2f}`")
         
-        for target in results:
+        for target in buy_targets:
             sym = target['symbol']
             if sym not in p.get("holdings", {}):
-                shares = round(budget / target['price'], 4) # 計算零股，保留 4 位小數
+                shares = round(budget / target['price'], 4) 
                 if shares > 0.0001:
                     p["cash"] -= shares * target['price']
                     if "holdings" not in p: p["holdings"] = {}
@@ -320,8 +399,8 @@ async def perform_scan(force_send=False):
 
     save_portfolio(p)
     if force_send or msg_lines:
-        final_msg = "🦅 **【美股量化引擎執行報告】**\n" + "\n".join(msg_lines)
-        await channel.send(final_msg[:2000])
+        final_msg = "\n".join(msg_lines)
+        await channel.send(final_msg[:1990])
 
 async def show_portfolio(channel):
     p = load_portfolio()
