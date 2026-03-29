@@ -463,25 +463,40 @@ async def show_portfolio(channel):
 # ==========================================
 # 8. 智慧指令路由
 # ==========================================
+# ==========================================
+# 8. 智慧指令路由
+# ==========================================
 @bot.event
 async def on_message(message):
     if message.author == bot.user: return
-    content = message.content.strip().upper()
+    
+    # 原始文字 (用來判斷中文)
+    raw_content = message.content.strip()
+    # 轉大寫 (用來判斷美股代號)
+    upper_content = raw_content.upper()
 
-    if content in ["美股庫存", "庫存", "帳本"]:
+    # 1. 處理中文系統指令
+    if raw_content in ["美股庫存", "庫存", "帳本"]:
         await show_portfolio(message.channel)
         return
-    if content in ["美股掃描", "全面掃描", "大盤"]:
+    if raw_content in ["美股掃描", "全面掃描", "大盤"]:
         await perform_scan(force_send=True)
         return
 
-    # 支援查詢代號 (例如 AAPL, TSLA)
-    if content in STOCK_NAMES or content.isalpha() and len(content) <= 5: 
-        await process_stock_query(message.channel, content)
+    # 2. 處理單股查詢指令 (加上防呆機制)
+    # 我們不再隨便攔截 5 個字母以內的英文。
+    # 只有當輸入的是名單內的代號，或者使用者加上 '$' 符號 (例如 $AAPL) 時才查詢
+    if upper_content in STOCK_NAMES:
+        await process_stock_query(message.channel, upper_content)
+        return
+    elif upper_content.startswith('$') and upper_content[1:].isalpha() and len(upper_content) <= 6:
+        # 允許使用者用 $ 加上代號來查詢名單外的股票 (例如 $PLTR)
+        stock_symbol = upper_content[1:]
+        await process_stock_query(message.channel, stock_symbol)
         return
 
+    # 讓 bot 繼續處理其他帶有 prefix 的標準指令 (例如 !help)
     await bot.process_commands(message)
-
 # ==========================================
 # 🌟 內建每日自動掃描鬧鐘
 # ==========================================
