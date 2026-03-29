@@ -162,7 +162,7 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 6. 單股多維度全息掃描 (華爾街 5 大模塊)
+# 6. 單股多維度全息掃描 (華爾街 5 大模塊 + 量能乖離升級版)
 # ==========================================
 async def process_stock_query(channel, symbol):
     initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 啟動全息多維度掃描 (機構級數據連線中)...")
@@ -177,63 +177,79 @@ async def process_stock_query(channel, symbol):
         df_1d = calculate_indicators(df_1d)
         df_1wk = calculate_indicators(df_1wk)
 
+        # --- 取得最新報價與關鍵數據 ---
         c_price = df_1d['Close'].iloc[-1]
         atr = df_1d['ATR_14'].iloc[-1]
         ema200 = df_1d['EMA_200'].iloc[-1]
-
-        # 模塊 1：趨勢過濾
-        trend_status = "🟢 長線多頭 (適合做多)" if c_price > ema200 else "🔴 長線空頭 (禁止做多，僅限做空)"
         
-        # 模塊 2：短線 (1H)
+        # 🆕 計算成交量倍數 (20日均量)
+        vol_ma20 = df_1d['Volume'].rolling(20).mean().iloc[-1]
+        vol_ratio = df_1d['Volume'].iloc[-1] / vol_ma20 if vol_ma20 > 0 else 0
+        
+        # 🆕 計算 200 EMA 乖離率
+        bias_200 = ((c_price - ema200) / ema200) * 100
+        bias_str = f"{bias_200:+.1f}%"
+        if bias_200 > 30: bias_str += " ⚠️高乖離"
+        
+        # 🆕 計算布林通道壓力位
+        ma20 = df_1d['MA_20'].iloc[-1]
+        std20 = df_1d['Close'].rolling(20).std().iloc[-1]
+        upper_bb = ma20 + (2 * std20)
+
+        # --- 模塊判斷邏輯 (不變) ---
+        trend_status = "🟢 長線多頭 (順勢做多)" if c_price > ema200 else "🔴 長線空頭 (順勢做空)"
+        
         h_macd, h_sig = df_1h['MACD'].iloc[-1], df_1h['MACD_SIG'].iloc[-1]
         h_ema14, h_ema50 = df_1h['EMA_14'].iloc[-1], df_1h['EMA_50'].iloc[-1]
-        short_signal = "觀望"
+        short_signal = "觀望 (動能不足)"
         if c_price > ema200 and (h_macd > h_sig) and (h_macd < 0) and (h_ema14 > h_ema50):
-            short_signal = "🚀【買入訊號】MACD 動能金叉且均線共振"
+            short_signal = "🚀【極限狙擊】MACD 零軸下金叉且均線共振"
         
-        # 模塊 3：中線 (Daily)
         d_ema25, d_ema75, d_ema140 = df_1d['EMA_25'].iloc[-1], df_1d['EMA_75'].iloc[-1], df_1d['EMA_140'].iloc[-1]
         d_rsi75 = df_1d['RSI_75'].iloc[-1]
         d_k, d_d = df_1d['STOCH_K'].iloc[-1], df_1d['STOCH_D'].iloc[-1]
-        mid_signal = "觀望"
+        mid_signal = "觀望 (結構未明)"
         if (d_ema25 > d_ema75 > d_ema140) and (d_rsi75 > 50):
             if d_k > d_d and d_k < 30: 
-                mid_signal = "🎯【狙擊買點】價格回調完成，隨機指標超賣區金叉"
+                mid_signal = "🎯【黃金買點】價格回調支撐，隨機指標超賣區金叉"
             else:
-                mid_signal = "⏳【等待回調】多頭排列強勢，等待 KD 落入 20 以下"
+                mid_signal = "⏳【耐心等待】多頭排列強勢，等待 KD 落入 20 以下"
 
-        # 模塊 4：長線 (Weekly)
         w_ma20, w_ma50 = df_1wk['MA_20'].iloc[-1], df_1wk['MA_50'].iloc[-1]
-        long_signal = "觀望"
+        long_signal = "觀望 (趨勢未成)"
         if w_ma20 > w_ma50:
             long_signal = "📈【持股續抱】週線 20/50 多頭排列，吃到大趨勢"
 
-        # 模塊 5：風險管理計算
+        # --- 模塊五：風險管理計算 ---
         stop_loss = min(d_ema140, c_price - (1.5 * atr))
         risk = c_price - stop_loss
         target_price = c_price + (risk * 2) 
 
-        msg = f"📊 **【{symbol} 華爾街多維度全息診斷報告】** 報價: `${c_price:.2f}`\n"
-        msg += f"🛡️ **模塊一 (大局趨勢)**: {trend_status} (200 EMA: `${ema200:.2f}`)\n"
-        msg += "----------------------------------------\n"
+        # ==========================================
+        # 組合終極版報告版面
+        # ==========================================
+        msg = f"📊 **【{symbol} 華爾街量化全息診斷】**\n"
+        msg += f"> 💵 現價: **`${c_price:.2f}`** | ⚡ 成交量: `{vol_ratio:.1f}x` 均量\n"
+        msg += f"> 📏 200EMA 乖離: `{bias_str}` | 🌋 短壓 (布林): `${upper_bb:.2f}`\n"
+        msg += "========================================\n"
+        msg += f"🛡️ **模塊一 (大局視角)**: {trend_status}\n"
         msg += f"⏱️ **短線策略 (1H)**: {short_signal}\n"
-        msg += f"📅 **中線策略 (Daily)**: {mid_signal}\n"
-        msg += f"🔭 **長線策略 (Weekly)**: {long_signal}\n"
-        msg += "----------------------------------------\n"
-        msg += f"⚖️ **模塊五 (風險管理與 ATR 動態計畫)**\n"
+        msg += f"📅 **中線波段 (1D)**: {mid_signal}\n"
+        msg += f"🔭 **長線跟蹤 (1W)**: {long_signal}\n"
+        msg += "========================================\n"
+        msg += f"⚖️ **模塊五 (ATR 動態風險管理)**\n"
         
         if c_price > ema200:
-            msg += f"> 🛑 **強勢停損 (Stop Loss)**: 跌破 `${stop_loss:.2f}` 立即出場\n"
-            msg += f"> 🎯 **最小獲利目標 (Target)**: `${target_price:.2f}` (盈虧比 1:2)\n"
-            msg += f"> 💡 **動態出場**: 獲利後請以收盤價跌破 140 EMA (`${d_ema140:.2f}`) 作為防守。\n"
+            msg += f"🔴 **防守紅線 (Stop Loss)**: 跌破 `${stop_loss:.2f}` 立即停損\n"
+            msg += f"🟢 **進攻目標 (Target 1:2)**: 上看 `${target_price:.2f}`\n"
+            msg += f"💡 **移動停利**: 獲利後請以收盤價跌破 `${d_ema140:.2f}` (140EMA) 出場。\n"
         else:
-            msg += "> ⚠️ 目前處於長線空頭，系統拒絕給予做多計畫，建議空手等待。"
+            msg += "⚠️ 目前處於長線空頭，系統拒絕給予做多計畫，建議尋找做空標的或空手等待。"
 
         await initial_msg.edit(content=msg)
     except Exception as e:
         await initial_msg.edit(content=f"❌ 系統錯誤！無法生成報告。")
         print(e)
-
 # ==========================================
 # 7. 華爾街 AI 多因子評分掃描引擎 + 自動佈局
 # ==========================================
