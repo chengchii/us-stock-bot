@@ -6,9 +6,12 @@ import asyncio
 import json
 import requests
 import yfinance as yf
-from datetime import datetime, time, timezone
+import numpy as np
+import time
+from datetime import datetime, timezone
 from threading import Thread
 from flask import Flask
+from io import StringIO
 
 # --- 偽裝成瀏覽器的 Session ---
 session = requests.Session()
@@ -19,7 +22,7 @@ session.headers.update({
 # --- Render 存活檢查 ---
 app = Flask('')
 @app.route('/')
-def home(): return "US Quant Bot: Master Level Engine Online!"
+def home(): return "US Quant Bot: Institutional Engine Online!"
 def run(): app.run(host='0.0.0.0', port=10000)
 def keep_alive(): Thread(target=run).start()
 
@@ -43,7 +46,6 @@ def get_nasdaq_100_tickers():
         print("🌐 正在下載 NASDAQ 100 成分股...")
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
         html_data = session.get(url, timeout=10).text 
-        from io import StringIO
         tables = pd.read_html(StringIO(html_data))
         for table in tables:
             if 'Ticker' in table.columns:
@@ -80,32 +82,55 @@ def save_portfolio(p):
     with open(PORTFOLIO_FILE, "w") as f: json.dump(p, f, indent=4)
 
 # ==========================================
-# 4. 完美數據引擎 (Twelve Data API)
+# 4. 完美數據引擎 (加入降速與節能機制)
 # ==========================================
-async def fetch_multi_timeframe_data(symbol):
+async def fetch_multi_timeframe_data(symbol, daily_only=False):
+    """
+    daily_only: 掃描模式開啟時設為 True，只抓日線，節省 66% API 額度
+    """
     if not TWELVE_API_KEY:
+        print("❌ 找不到 Twelve Data API Key！")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        
     loop = asyncio.get_running_loop()
+
     def get_twelve_data(interval, outputsize):
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_API_KEY}"
-        try:
-            response = requests.get(url, timeout=10).json()
-            if 'values' in response:
-                df = pd.DataFrame(response['values'])
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                df.set_index('datetime', inplace=True)
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = df[col].astype(float)
-                df = df.sort_index(ascending=True)
-                df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-                return df
-            return pd.DataFrame()
-        except:
-            return pd.DataFrame()
-    df_1h = await loop.run_in_executor(None, lambda: get_twelve_data("1h", 1000))
-    df_1d = await loop.run_in_executor(None, lambda: get_twelve_data("1day", 500))
-    df_1wk = await loop.run_in_executor(None, lambda: get_twelve_data("1week", 260))
-    return df_1h, df_1d, df_1wk
+        for attempt in range(3): # 最多重試 3 次
+            try:
+                response = requests.get(url, timeout=10).json()
+                # 攔截 429 錯誤：如果達到每分鐘 8 次上限，強迫休息 15 秒
+                if response.get('code') == 429:
+                    print(f"⏳ {symbol} 達到 API 速率限制 ({interval})，冷卻 15 秒...")
+                    time.sleep(15)
+                    continue 
+                
+                if 'values' in response:
+                    df = pd.DataFrame(response['values'])
+                    df['datetime'] = pd.to_datetime(df['datetime'])
+                    df.set_index('datetime', inplace=True)
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        df[col] = df[col].astype(float)
+                    df = df.sort_index(ascending=True)
+                    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+                    return df
+                return pd.DataFrame()
+            except Exception as e:
+                time.sleep(2)
+        return pd.DataFrame()
+
+    if daily_only:
+        # 掃描模式：只抓日線，省下大量 API 額度
+        df_1d = await loop.run_in_executor(None, lambda: get_twelve_data("1day", 500))
+        return pd.DataFrame(), df_1d, pd.DataFrame()
+    else:
+        # 單股查詢模式：短中長全抓，中間休息 1 秒避免瞬間塞爆
+        df_1h = await loop.run_in_executor(None, lambda: get_twelve_data("1h", 1000))
+        await asyncio.sleep(1)
+        df_1d = await loop.run_in_executor(None, lambda: get_twelve_data("1day", 500))
+        await asyncio.sleep(1)
+        df_1wk = await loop.run_in_executor(None, lambda: get_twelve_data("1week", 260))
+        return df_1h, df_1d, df_1wk
 
 # ==========================================
 # 5. 量化技術指標計算大腦
@@ -139,14 +164,15 @@ def calculate_indicators(df):
     return df
 
 # ==========================================
-# 6. 單股多維度全息掃描 (華爾街 5 大模塊)
+# 6. 單股多維度全息掃描
 # ==========================================
 async def process_stock_query(channel, symbol):
     initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 啟動全息多維度掃描...")
+    loop = asyncio.get_running_loop()
     try:
-        df_1h, df_1d, df_1wk = await fetch_multi_timeframe_data(symbol)
+        df_1h, df_1d, df_1wk = await fetch_multi_timeframe_data(symbol, daily_only=False)
         if df_1d.empty or len(df_1d) < 200:
-            await initial_msg.edit(content=f"❌ `{symbol}` 數據不足。")
+            await initial_msg.edit(content=f"❌ `{symbol}` 數據不足或 API 達到上限。")
             return
             
         df_1h = calculate_indicators(df_1h)
@@ -157,6 +183,19 @@ async def process_stock_query(channel, symbol):
         atr = df_1d['ATR_14'].iloc[-1]
         ema200 = df_1d['EMA_200'].iloc[-1]
         
+        def fetch_info():
+            try: return yf.Ticker(symbol).info
+            except: return {}
+        info = await loop.run_in_executor(None, fetch_info)
+        target_price_wallst = info.get('targetMeanPrice', 0)
+        eps = info.get('trailingEps', 0)
+        
+        upside_str = ""
+        if target_price_wallst > 0:
+            upside = ((target_price_wallst - c_price) / c_price) * 100
+            upside_str = f" | 🎯外資目標價: `${target_price_wallst:.2f}` (潛在空間: `{upside:+.1f}%`)"
+        eps_str = f" | 💼 EPS: `{eps}`" + (" ⚠️虧損" if eps and eps < 0 else " ✅獲利")
+
         vol_ma20 = df_1d['Volume'].rolling(20).mean().iloc[-1]
         vol_ratio = df_1d['Volume'].iloc[-1] / vol_ma20 if vol_ma20 > 0 else 0
         bias_200 = ((c_price - ema200) / ema200) * 100
@@ -189,6 +228,7 @@ async def process_stock_query(channel, symbol):
         msg = f"📊 **【{symbol} 華爾街量化全息診斷】**\n"
         msg += f"> 💵 現價: **`${c_price:.2f}`** | ⚡ 成交量: `{vol_ratio:.1f}x` 均量\n"
         msg += f"> 📏 200EMA 乖離: `{bias_str}` | 🌋 短壓 (布林): `${upper_bb:.2f}`\n"
+        msg += f"> 🏦 **機構共識**:{upside_str}{eps_str}\n"
         msg += "========================================\n"
         msg += f"🛡️ **模塊一 (大局視角)**: {trend_status}\n"
         msg += f"⏱️ **短線策略 (1H)**: {short_signal}\n"
@@ -198,7 +238,7 @@ async def process_stock_query(channel, symbol):
         msg += f"⚖️ **模塊五 (ATR 動態風險管理)**\n"
         if c_price > ema200:
             msg += f"🔴 **初始停損**: 跌破 `${stop_loss:.2f}` 立即認賠\n"
-            msg += f"🟢 **進攻目標**: 上看 `${target_price:.2f}` (盈虧比 1:2)\n"
+            msg += f"🟢 **進攻目標**: 上看 `${target_price:.2f}`\n"
             msg += f"💡 **ATR 移動停利**: 獲利後請將出場點調高至 `波段最高價 - ${(atr_multiplier * atr):.2f}`\n"
         else:
             msg += "⚠️ 目前處於長線空頭，系統拒絕給予做多計畫。"
@@ -207,14 +247,13 @@ async def process_stock_query(channel, symbol):
     except Exception as e:
         await initial_msg.edit(content=f"❌ 系統錯誤！")
 
-
 # ==========================================
-# 7. 華爾街雙軌決策 AI 掃描引擎 (趨勢順勢 vs 恐慌抄底)
+# 7. 終極 AI 掃描引擎 (降速保護 + RS)
 # ==========================================
 async def perform_scan(force_send=False):
     channel = bot.get_channel(int(CHANNEL_ID))
     if not channel: return
-
+    loop = asyncio.get_running_loop()
     p = load_portfolio()
     msg_lines = []
     
@@ -224,162 +263,172 @@ async def perform_scan(force_send=False):
         p["last_month"] = curr_month
         msg_lines.append(f"🏦 **美股入金**：已存入 ${INVEST_AMOUNT} USD，現金餘額：`${p['cash']:.2f}`")
 
-    # 🛡️ 總經雷達：判定當前市場環境
     try:
-        vix_data = yf.download("^VIX", period="5d", progress=False)
+        def get_vix(): return yf.download("^VIX", period="5d", progress=False)
+        vix_data = await loop.run_in_executor(None, get_vix)
         current_vix = float(vix_data['Close'].iloc[-1].iloc[0]) if not vix_data.empty else 20.0
-    except:
-        current_vix = 20.0
+    except: current_vix = 20.0
 
     is_bull_market = False
     is_panic_market = False
+    spy_mom20 = 0.0 
 
     if current_vix > 30:
         is_panic_market = True
         msg_lines.append(f"🚨 **【總經核彈警報】** VIX 恐慌指數飆升至 `{current_vix:.2f}`！")
-        msg_lines.append("> 🛡️ **右側策略建議**: 趨勢已遭破壞，建議保守投資者空手觀望，保護本金。")
-        msg_lines.append("> 🩸 **左側策略建議**: 巴菲特貪婪時刻！啟動「極度超賣 + 基本面護城河」抄底掃描...")
+        msg_lines.append("> 🛡️ 建議保守投資者空手觀望。")
+        msg_lines.append("> 🩸 啟動「極度超賣 + 基本面護城河」抄底掃描...")
     else:
-        _, df_market, _ = await fetch_multi_timeframe_data("SPY")
+        # 大盤判定也使用 daily_only=True
+        _, df_market, _ = await fetch_multi_timeframe_data("SPY", daily_only=True)
         if df_market.empty:
             msg_lines.append("⚠️ 警告：無法取得 SPY 數據，暫停買進。")
         else:
-            ma60_market = df_market['Close'].tail(60).mean()
-            is_bull_market = df_market['Close'].iloc[-1] > ma60_market
+            spy_close = df_market['Close']
+            ma60_market = spy_close.tail(60).mean()
+            is_bull_market = spy_close.iloc[-1] > ma60_market
+            if len(spy_close) >= 20:
+                spy_mom20 = (spy_close.iloc[-1] - spy_close.iloc[-20]) / spy_close.iloc[-20]
+            
             if is_bull_market:
                 msg_lines.append(f"🦅 大盤安全 (VIX: `{current_vix:.1f}`)。啟動「大師級順勢動能」掃描...")
             else:
-                msg_lines.append("🛑 **【美股警報】** S&P 500 (SPY) 跌破季線。盤整偏空，暫停右側突破買進。")
+                msg_lines.append("🛑 **【美股警報】** S&P 500 跌破季線。暫停右側突破買進。")
 
     results = []
     panic_buy_results = []
     
-    # 只要是大牛市(順勢)，或是大恐慌(抄底)，我們都啟動掃描
     if is_bull_market or is_panic_market:
-        scan_msg = await channel.send("機房全力運算中，正在掃描 NASDAQ 100 強 (約需 3~5 分鐘)...")
+        scan_msg = await channel.send("⏳ 機房全力運算中，為符合 API 速率限制，預計需時 10~15 分鐘，請耐心等候...")
         
         for s in WATCHLIST:
-            _, df, _ = await fetch_multi_timeframe_data(s)
-            if df.empty or len(df) < 200: continue
+            # 🚀 掃描模式只抓日線！一次只用掉 1 個 API 額度
+            _, df, _ = await fetch_multi_timeframe_data(s, daily_only=True)
+            if df.empty or len(df) < 200: 
+                await asyncio.sleep(2) # 沒抓到也稍微休息
+                continue
             
             try:
+                df = calculate_indicators(df)
                 close = df['Close']
                 vol = df['Volume']
-                ema200 = close.ewm(span=200, adjust=False).mean()
-                macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-                sig = macd.ewm(span=9, adjust=False).mean()
                 
-                delta = close.diff()
-                up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
-                rsi = 100 - (100 / (1 + up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()))
-                
-                ma20 = close.rolling(window=20).mean()
-                std20 = close.rolling(window=20).std()
-                upper_bb = ma20 + (2 * std20)
-                vol_ma20 = vol.rolling(window=20).mean()
-
-                high_low = df['High'] - df['Low']
-                high_close = (df['High'] - df['Close'].shift()).abs()
-                low_close = (df['Low'] - df['Close'].shift()).abs()
-                tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-                atr = tr.rolling(window=14).mean().iloc[-1]
-
                 c_price = close.iloc[-1]
-                c_macd = macd.iloc[-1]
-                c_sig = sig.iloc[-1]
-                c_rsi = rsi.iloc[-1]
+                c_macd = df['MACD'].iloc[-1]
+                c_sig = df['MACD_SIG'].iloc[-1]
+                c_rsi = df['RSI_75'].iloc[-1]
+                ema200 = df['EMA_200'].iloc[-1]
+                atr = df['ATR_14'].iloc[-1]
+                
+                ma20 = df['MA_20'].iloc[-1]
+                std20 = close.rolling(window=20).std().iloc[-1]
+                upper_bb = ma20 + (2 * std20)
+                
+                vol_ma20 = vol.rolling(window=20).mean().iloc[-1]
                 c_vol = vol.iloc[-1]
-                c_vol_ma20 = vol_ma20.iloc[-1]
+
+                stock_mom20 = (c_price - close.iloc[-20]) / close.iloc[-20] if len(close) >= 20 else 0
+                rs_score = stock_mom20 - spy_mom20 
 
                 score = 0
                 badges = []
 
-                if c_price > ema200.iloc[-1]: score += 15
+                if c_price > ema200: score += 15
                 if c_macd > c_sig: score += 10
                 if c_macd > 0: score += 10 
+                
+                if rs_score > 0: 
+                    score += 10
+                    if rs_score > 0.05: badges.append("🌟抗跌領漲")
 
-                vol_ratio = c_vol / c_vol_ma20 if c_vol_ma20 > 0 else 0
+                vol_ratio = c_vol / vol_ma20 if vol_ma20 > 0 else 0
                 vol_score = min(30, int(vol_ratio * 10)) 
                 score += vol_score
                 if vol_score >= 20: badges.append("🔥機構爆量")
 
-                if c_price > upper_bb.iloc[-1]:
+                if c_price > upper_bb:
                     score += 20; badges.append("🌋突破壓力")
-                elif c_price > ma20.iloc[-1]:
+                elif c_price > ma20:
                     score += 10 
 
-                if 55 <= c_rsi <= 65:
-                    score += 15; badges.append("🎯完美時機")
-                elif 50 < c_rsi < 55 or 65 < c_rsi <= 70:
-                    score += 10
-                elif c_rsi > 70:
-                    score += 5; badges.append("⚠️留意追高")
+                if 55 <= c_rsi <= 65: score += 15; badges.append("🎯完美時機")
+                elif 50 < c_rsi < 55 or 65 < c_rsi <= 70: score += 10
+                elif c_rsi > 70: score += 5; badges.append("⚠️留意追高")
 
-                # 軌道 1：右側順勢名單 (大牛市才會觸發)
                 if is_bull_market and score >= 60 and c_macd > c_sig:
                     results.append({
                         'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price,
-                        'score': score, 'vol_ratio': vol_ratio, 'badges': badges, 'atr': atr
+                        'score': score, 'vol_ratio': vol_ratio, 'badges': badges, 'atr': atr, 'rs': rs_score
                     })
                 
-                # 軌道 2：左側抄底名單 (大恐慌才會觸發，條件是 RSI 跌破 30 極度超賣)
                 if is_panic_market and c_rsi < 30:
                     panic_buy_results.append({
                         'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price,
-                        'rsi': c_rsi, 'vol_ratio': vol_ratio, 'badges': ["🩸極度超賣"], 'atr': atr
+                        'rsi': c_rsi, 'vol_ratio': vol_ratio, 'badges': ["🩸極度超賣"], 'atr': atr, 'rs': rs_score
                     })
             except:
-                continue
-            await asyncio.sleep(0.3)
+                pass
+            
+            # ⏳ 降速保護：每掃完一檔股票，強迫休息 8 秒，確保不會被 Twelve Data 封鎖
+            await asyncio.sleep(8)
             
         try: await scan_msg.delete()
         except: pass
 
-        # --- 輸出報告與基本面過濾 ---
         final_buy_targets = []
-        
-        # 情境 A：順勢多頭報告
+        def check_fundamentals(sym):
+            try: return yf.Ticker(sym).info
+            except: return {}
+
         if is_bull_market and results:
-            results.sort(key=lambda x: (x['score'], x['vol_ratio']), reverse=True)
-            msg_lines.append(f"\n📈 **【右側順勢：動能強勢股名單】**")
+            results.sort(key=lambda x: (x['score'], x['rs']), reverse=True) 
+            msg_lines.append(f"\n📈 **【右側順勢：高 RS 領頭羊名單】**")
             for idx, r in enumerate(results[:5]):
-                try:
-                    info = yf.Ticker(r['symbol']).info
-                    if info.get('trailingEps', 1) is not None and info.get('trailingEps', 1) < 0:
-                        r['badges'].append("☠️虧損企業(剔除)")
-                        r['score'] -= 50 
-                except: pass
+                info = await loop.run_in_executor(None, check_fundamentals, r['symbol'])
+                if info.get('trailingEps', 1) is not None and info.get('trailingEps', 1) < 0:
+                    r['badges'].append("☠️虧損剔除")
+                    r['score'] -= 50 
+                
+                target_p = info.get('targetMeanPrice', 0)
+                upside_str = ""
+                if target_p > r['price']:
+                    upside_str = f" | 🎯潛在空間 `+{((target_p - r['price'])/r['price'])*100:.1f}%`"
+                elif target_p > 0 and target_p < r['price']:
+                    r['badges'].append("⚠️估值偏高")
                 
                 badge_str = " ".join(r['badges'])
-                msg_lines.append(f"🔸 **{r['symbol']} ({r['name']})** | 評分: `{r['score']}` | 標籤: {badge_str}")
-                if r['score'] >= 60 and "☠️虧損企業(剔除)" not in r['badges']: final_buy_targets.append(r)
+                msg_lines.append(f"🔸 **{r['symbol']} ({r['name']})** | 評分:`{r['score']}` | RS:`{r['rs']*100:+.1f}%`{upside_str}")
+                msg_lines.append(f"> 🏷️ 標籤: {badge_str}")
+                if r['score'] >= 60 and "☠️虧損剔除" not in r['badges'] and "⚠️估值偏高" not in r['badges']: 
+                    final_buy_targets.append(r)
 
-        # 情境 B：左側抄底報告
         if is_panic_market and panic_buy_results:
-            panic_buy_results.sort(key=lambda x: x['rsi']) # RSI 越低(越超賣)排越前面
-            msg_lines.append(f"\n📉 **【左側抄底：價值浮現巨頭名單】** (已過濾基本面)")
+            panic_buy_results.sort(key=lambda x: x['rsi']) 
+            msg_lines.append(f"\n📉 **【左側抄底：價值浮現巨頭名單】**")
             for idx, r in enumerate(panic_buy_results[:5]):
-                # 抄底極度危險，嚴格檢查基本面，虧損公司絕對不碰
-                try:
-                    info = yf.Ticker(r['symbol']).info
-                    eps = info.get('trailingEps', 1)
-                    if eps is not None and eps < 0: continue # 直接跳過不顯示
-                except: pass
-                
+                info = await loop.run_in_executor(None, check_fundamentals, r['symbol'])
+                eps = info.get('trailingEps', 1)
+                if eps is not None and eps < 0: continue 
                 msg_lines.append(f"🩸 **{r['symbol']} ({r['name']})** | 現價: `${r['price']:.2f}` | RSI: `{r['rsi']:.1f}`")
-                final_buy_targets.append(r) # 將優質抄底目標納入買進名單
-                
-        if not final_buy_targets and (is_bull_market or is_panic_market):
-            msg_lines.append("\n🔎 AI 巡邏完畢，目前無符合雙軌策略之標的。")
+                final_buy_targets.append(r) 
 
-    # 💼 持股停利損檢查 (ATR 動態追蹤)
+    # 💼 1. 持股停利損檢查
+    if "SHV" in p.get("holdings", {}):
+        try:
+            shv_data = await loop.run_in_executor(None, lambda: yf.Ticker("SHV").history(period="1d"))
+            shv_price = shv_data['Close'].iloc[-1]
+            p["cash"] += p["holdings"]["SHV"]["shares"] * shv_price
+            del p["holdings"]["SHV"]
+            msg_lines.append(f"🔄 **資金釋放**：自動贖回短期美債 (SHV)，釋放投資火力。")
+        except: pass
+
     for sym, data_p in list(p.get("holdings", {}).items()):
-        _, df, _ = await fetch_multi_timeframe_data(sym)
+        if sym == "SHV": continue
+        _, df, _ = await fetch_multi_timeframe_data(sym, daily_only=True)
         if df.empty: continue
+        df = calculate_indicators(df)
         curr_p = df['Close'].iloc[-1]
-        
-        tr = pd.concat([df['High'] - df['Low'], (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()], axis=1).max(axis=1)
-        curr_atr = tr.rolling(window=14).mean().iloc[-1]
+        curr_atr = df['ATR_14'].iloc[-1]
         
         if curr_p > data_p["high_price"]: data_p["high_price"] = curr_p
         
@@ -394,13 +443,12 @@ async def perform_scan(force_send=False):
             msg_lines.append(f"🚨 **ATR 動態平倉**：{name} 賣出價 `${curr_p:.2f}` (總報酬 `{profit_pct:.1f}%`)")
             del p["holdings"][sym]
 
-    # 🛒 橋水注碼法：波動率平價分配 (無論是順勢還是抄底，都適用嚴格風控)
+    # 🛒 2. 執行橋水注碼買進
     if final_buy_targets and p.get("cash", 0) > 10: 
-        buy_targets = final_buy_targets[:5] 
         msg_lines.append(f"\n🛒 **【機構級自動注碼 (ATR 平價)】**")
         total_risk_capital = p.get("cash", 0) * 0.02 
         
-        for target in buy_targets:
+        for target in final_buy_targets[:5]:
             sym = target['symbol']
             if sym not in p.get("holdings", {}):
                 risk_per_share = 1.5 * target['atr']
@@ -419,10 +467,38 @@ async def perform_scan(force_send=False):
                     p["holdings"][sym] = {"shares": shares, "avg_cost": target['price'], "high_price": target['price']}
                     msg_lines.append(f"└ 買入 {sym} `{shares:.4f}` 股 (投入 `${cost:.2f}`) | ATR:`{target['atr']:.2f}`")
 
+    # 🏦 3. 閒置資金停泊機制
+    if p.get("cash", 0) > 100:
+        try:
+            shv_data = await loop.run_in_executor(None, lambda: yf.Ticker("SHV").history(period="1d"))
+            shv_price = shv_data['Close'].iloc[-1]
+            shv_shares = round(p["cash"] / shv_price, 4)
+            if shv_shares > 0:
+                p["cash"] -= shv_shares * shv_price
+                if "holdings" not in p: p["holdings"] = {}
+                p["holdings"]["SHV"] = {"shares": shv_shares, "avg_cost": shv_price, "high_price": shv_price}
+                msg_lines.append(f"\n🏦 **【資金停泊】** 剩餘現金自動買入 `{shv_shares:.2f}` 股短期美債(SHV)。")
+        except: pass
+
     save_portfolio(p)
     if force_send or msg_lines:
         final_msg = "\n".join(msg_lines)
         await channel.send(final_msg[:1990])
+
+async def show_portfolio(channel):
+    p = load_portfolio()
+    msg = f"💼 **美股機構帳戶總覽**\n💵 **可用現金：** `${p.get('cash', 0):.2f}` USD\n"
+    if not p.get("holdings"):
+        msg += "📭 目前空手觀望中。"
+    else:
+        msg += "📦 **當前持股 (ATR 動態保護中)：**\n"
+        for sym, d in p["holdings"].items():
+            if sym == "SHV":
+                msg += f"🏦 **SHV (短期美債)**: `{d['shares']:.2f}`股 (資金避風港)\n"
+            else:
+                msg += f"🔸 **{sym}** ({STOCK_NAMES.get(sym, sym)}): `{d['shares']:.4f}`股 (平均成本:`${d['avg_cost']:.2f}`)\n"
+    await channel.send(msg)
+
 # ==========================================
 # 8. 智慧指令路由
 # ==========================================
