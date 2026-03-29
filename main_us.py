@@ -207,8 +207,9 @@ async def process_stock_query(channel, symbol):
     except Exception as e:
         await initial_msg.edit(content=f"❌ 系統錯誤！")
 
+
 # ==========================================
-# 7. 華爾街大師級 AI 掃描引擎 (VIX + 基本面 + ATR注碼)
+# 7. 華爾街雙軌決策 AI 掃描引擎 (趨勢順勢 vs 恐慌抄底)
 # ==========================================
 async def perform_scan(force_send=False):
     channel = bot.get_channel(int(CHANNEL_ID))
@@ -223,31 +224,39 @@ async def perform_scan(force_send=False):
         p["last_month"] = curr_month
         msg_lines.append(f"🏦 **美股入金**：已存入 ${INVEST_AMOUNT} USD，現金餘額：`${p['cash']:.2f}`")
 
-    # 🛡️ 達里歐模塊：VIX 恐慌避險雷達
+    # 🛡️ 總經雷達：判定當前市場環境
     try:
         vix_data = yf.download("^VIX", period="5d", progress=False)
         current_vix = float(vix_data['Close'].iloc[-1].iloc[0]) if not vix_data.empty else 20.0
     except:
         current_vix = 20.0
 
+    is_bull_market = False
+    is_panic_market = False
+
     if current_vix > 30:
-        msg_lines.append(f"🚨 **【總經核彈警報】** VIX 恐慌指數飆升至 `{current_vix:.2f}`！市場極度恐慌，系統強制進入「現金為王」避險模式，停止所有買進！")
-        is_bull_market = False
+        is_panic_market = True
+        msg_lines.append(f"🚨 **【總經核彈警報】** VIX 恐慌指數飆升至 `{current_vix:.2f}`！")
+        msg_lines.append("> 🛡️ **右側策略建議**: 趨勢已遭破壞，建議保守投資者空手觀望，保護本金。")
+        msg_lines.append("> 🩸 **左側策略建議**: 巴菲特貪婪時刻！啟動「極度超賣 + 基本面護城河」抄底掃描...")
     else:
         _, df_market, _ = await fetch_multi_timeframe_data("SPY")
         if df_market.empty:
             msg_lines.append("⚠️ 警告：無法取得 SPY 數據，暫停買進。")
-            is_bull_market = False
         else:
             ma60_market = df_market['Close'].tail(60).mean()
             is_bull_market = df_market['Close'].iloc[-1] > ma60_market
-            if not is_bull_market:
-                msg_lines.append("🛑 **【美股警報】** S&P 500 (SPY) 跌破季線。空頭市場嚴禁做多！")
+            if is_bull_market:
+                msg_lines.append(f"🦅 大盤安全 (VIX: `{current_vix:.1f}`)。啟動「大師級順勢動能」掃描...")
+            else:
+                msg_lines.append("🛑 **【美股警報】** S&P 500 (SPY) 跌破季線。盤整偏空，暫停右側突破買進。")
 
     results = []
+    panic_buy_results = []
     
-    if is_bull_market:
-        scan_msg = await channel.send(f"🦅 大盤安全 (VIX: `{current_vix:.1f}`)。啟動「大師級 AI 模型」掃描 NASDAQ 100 強 (約需 3~5 分鐘)...")
+    # 只要是大牛市(順勢)，或是大恐慌(抄底)，我們都啟動掃描
+    if is_bull_market or is_panic_market:
+        scan_msg = await channel.send("機房全力運算中，正在掃描 NASDAQ 100 強 (約需 3~5 分鐘)...")
         
         for s in WATCHLIST:
             _, df, _ = await fetch_multi_timeframe_data(s)
@@ -269,7 +278,6 @@ async def perform_scan(force_send=False):
                 upper_bb = ma20 + (2 * std20)
                 vol_ma20 = vol.rolling(window=20).mean()
 
-                # 計算 ATR 供後續注碼使用
                 high_low = df['High'] - df['Low']
                 high_close = (df['High'] - df['Close'].shift()).abs()
                 low_close = (df['Low'] - df['Close'].shift()).abs()
@@ -296,24 +304,29 @@ async def perform_scan(force_send=False):
                 if vol_score >= 20: badges.append("🔥機構爆量")
 
                 if c_price > upper_bb.iloc[-1]:
-                    score += 20
-                    badges.append("🌋突破壓力")
+                    score += 20; badges.append("🌋突破壓力")
                 elif c_price > ma20.iloc[-1]:
                     score += 10 
 
                 if 55 <= c_rsi <= 65:
-                    score += 15
-                    badges.append("🎯完美時機")
+                    score += 15; badges.append("🎯完美時機")
                 elif 50 < c_rsi < 55 or 65 < c_rsi <= 70:
                     score += 10
                 elif c_rsi > 70:
-                    score += 5 
-                    badges.append("⚠️留意追高")
+                    score += 5; badges.append("⚠️留意追高")
 
-                if score >= 60 and c_macd > c_sig:
+                # 軌道 1：右側順勢名單 (大牛市才會觸發)
+                if is_bull_market and score >= 60 and c_macd > c_sig:
                     results.append({
                         'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price,
                         'score': score, 'vol_ratio': vol_ratio, 'badges': badges, 'atr': atr
+                    })
+                
+                # 軌道 2：左側抄底名單 (大恐慌才會觸發，條件是 RSI 跌破 30 極度超賣)
+                if is_panic_market and c_rsi < 30:
+                    panic_buy_results.append({
+                        'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price,
+                        'rsi': c_rsi, 'vol_ratio': vol_ratio, 'badges': ["🩸極度超賣"], 'atr': atr
                     })
             except:
                 continue
@@ -322,34 +335,42 @@ async def perform_scan(force_send=False):
         try: await scan_msg.delete()
         except: pass
 
-        # 🛡️ 巴菲特模塊：基本面財報過濾 (僅對高分股票進行)
+        # --- 輸出報告與基本面過濾 ---
         final_buy_targets = []
-        if results:
+        
+        # 情境 A：順勢多頭報告
+        if is_bull_market and results:
             results.sort(key=lambda x: (x['score'], x['vol_ratio']), reverse=True)
-            msg_lines.append(f"\n🤖 **【大師級 AI 綜合報告】** (篩選出 {len(results)} 檔技術面強勢股)")
-            
-            for idx, r in enumerate(results[:10]): # 只檢查前 10 名的財報以節省時間
-                # 向 Yahoo 查詢基本面 EPS
+            msg_lines.append(f"\n📈 **【右側順勢：動能強勢股名單】**")
+            for idx, r in enumerate(results[:5]):
                 try:
                     info = yf.Ticker(r['symbol']).info
-                    eps = info.get('trailingEps', 1) # 如果抓不到預設為通過
-                    if eps is not None and eps < 0:
-                        r['badges'].append("☠️虧損企業(拒買)")
-                        r['score'] -= 50 # 重罰虧損企業
-                except:
-                    pass
+                    if info.get('trailingEps', 1) is not None and info.get('trailingEps', 1) < 0:
+                        r['badges'].append("☠️虧損企業(剔除)")
+                        r['score'] -= 50 
+                except: pass
                 
-                rank_icon = "👑" if idx == 0 else ("🥈" if idx == 1 else ("🥉" if idx == 2 else "🔹"))
-                badge_str = " ".join(r['badges']) if r['badges'] else "溫和上漲"
-                msg_lines.append(f"{rank_icon} **Top {idx+1}: {r['symbol']} ({r['name']})**")
-                msg_lines.append(f"> 📊 綜合評分: **`{r['score']}分`** (現價 `${r['price']:.2f}`) | 成交量 `{r['vol_ratio']:.1f}x`")
-                msg_lines.append(f"> 🏷️ AI 標籤: {badge_str}\n")
+                badge_str = " ".join(r['badges'])
+                msg_lines.append(f"🔸 **{r['symbol']} ({r['name']})** | 評分: `{r['score']}` | 標籤: {badge_str}")
+                if r['score'] >= 60 and "☠️虧損企業(剔除)" not in r['badges']: final_buy_targets.append(r)
+
+        # 情境 B：左側抄底報告
+        if is_panic_market and panic_buy_results:
+            panic_buy_results.sort(key=lambda x: x['rsi']) # RSI 越低(越超賣)排越前面
+            msg_lines.append(f"\n📉 **【左側抄底：價值浮現巨頭名單】** (已過濾基本面)")
+            for idx, r in enumerate(panic_buy_results[:5]):
+                # 抄底極度危險，嚴格檢查基本面，虧損公司絕對不碰
+                try:
+                    info = yf.Ticker(r['symbol']).info
+                    eps = info.get('trailingEps', 1)
+                    if eps is not None and eps < 0: continue # 直接跳過不顯示
+                except: pass
                 
-                # 只有分數仍及格，且沒有被貼上虧損標籤的，才能進入最終買入名單
-                if r['score'] >= 60 and "☠️虧損企業(拒買)" not in r['badges']:
-                    final_buy_targets.append(r)
-        else:
-            msg_lines.append("\n🔎 AI 巡邏完畢，無任何股票達到 60 分及格線。")
+                msg_lines.append(f"🩸 **{r['symbol']} ({r['name']})** | 現價: `${r['price']:.2f}` | RSI: `{r['rsi']:.1f}`")
+                final_buy_targets.append(r) # 將優質抄底目標納入買進名單
+                
+        if not final_buy_targets and (is_bull_market or is_panic_market):
+            msg_lines.append("\n🔎 AI 巡邏完畢，目前無符合雙軌策略之標的。")
 
     # 💼 持股停利損檢查 (ATR 動態追蹤)
     for sym, data_p in list(p.get("holdings", {}).items()):
@@ -357,17 +378,11 @@ async def perform_scan(force_send=False):
         if df.empty: continue
         curr_p = df['Close'].iloc[-1]
         
-        # 取得個股的即時 ATR
-        high_low = df['High'] - df['Low']
-        high_close = (df['High'] - df['Close'].shift()).abs()
-        low_close = (df['Low'] - df['Close'].shift()).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        tr = pd.concat([df['High'] - df['Low'], (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()], axis=1).max(axis=1)
         curr_atr = tr.rolling(window=14).mean().iloc[-1]
         
-        # 更新波段最高價
         if curr_p > data_p["high_price"]: data_p["high_price"] = curr_p
         
-        # 動態 ATR 停利/停損點 (最高價回落 1.5 倍 ATR)
         trailing_stop = data_p["high_price"] - (1.5 * curr_atr)
         ema200 = df['EMA_200'].iloc[-1] if 'EMA_200' in df else curr_p * 0.5
         
@@ -379,25 +394,19 @@ async def perform_scan(force_send=False):
             msg_lines.append(f"🚨 **ATR 動態平倉**：{name} 賣出價 `${curr_p:.2f}` (總報酬 `{profit_pct:.1f}%`)")
             del p["holdings"][sym]
 
-    # 🛒 橋水注碼法：波動率平價分配 (Volatility Parity)
-    if is_bull_market and final_buy_targets and p.get("cash", 0) > 10: 
+    # 🛒 橋水注碼法：波動率平價分配 (無論是順勢還是抄底，都適用嚴格風控)
+    if final_buy_targets and p.get("cash", 0) > 10: 
         buy_targets = final_buy_targets[:5] 
-        msg_lines.append(f"\n🛒 **【橋水機構級注碼 (ATR 平價)】**")
-        
-        # 決定總曝險資金：每筆交易我們願意承擔總帳戶(現金) 2% 的風險
+        msg_lines.append(f"\n🛒 **【機構級自動注碼 (ATR 平價)】**")
         total_risk_capital = p.get("cash", 0) * 0.02 
         
         for target in buy_targets:
             sym = target['symbol']
             if sym not in p.get("holdings", {}):
-                # 算出這檔股票每股的風險 (1.5倍 ATR)
                 risk_per_share = 1.5 * target['atr']
-                if risk_per_share <= 0: risk_per_share = target['price'] * 0.05 # 防呆機制
+                if risk_per_share <= 0: risk_per_share = target['price'] * 0.05 
                 
-                # 計算應買股數 = 總承擔風險 / 每股風險
                 shares = round(total_risk_capital / risk_per_share, 4)
-                
-                # 防呆：單檔股票購買金額不能超過手上現金的 25%，避免 All-in
                 max_investment = p["cash"] * 0.25
                 cost = shares * target['price']
                 if cost > max_investment:
@@ -414,18 +423,6 @@ async def perform_scan(force_send=False):
     if force_send or msg_lines:
         final_msg = "\n".join(msg_lines)
         await channel.send(final_msg[:1990])
-
-async def show_portfolio(channel):
-    p = load_portfolio()
-    msg = f"💼 **美股機構帳戶總覽**\n💵 **可用現金：** `${p.get('cash', 0):.2f}` USD\n"
-    if not p.get("holdings"):
-        msg += "📭 目前空手觀望中。"
-    else:
-        msg += "📦 **當前持股 (ATR 動態保護中)：**\n"
-        for sym, d in p["holdings"].items():
-            msg += f"🔸 **{sym}** ({STOCK_NAMES.get(sym, sym)}): `{d['shares']:.4f}`股 (平均成本:`${d['avg_cost']:.2f}`)\n"
-    await channel.send(msg)
-
 # ==========================================
 # 8. 智慧指令路由
 # ==========================================
