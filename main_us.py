@@ -99,132 +99,162 @@ def save_portfolio(p):
     with open(PORTFOLIO_FILE, "w") as f: json.dump(p, f, indent=4)
 
 # ==========================================
-# 4. YFinance 數據引擎
+# 4. YFinance 數據引擎 (多時間級別版)
 # ==========================================
-# ==========================================
-# 4. YFinance 數據引擎 (強化版)
-# ==========================================
-async def fetch_single_stock_data(symbol, retries=3):
+import urllib.request
+
+async def fetch_multi_timeframe_data(symbol):
     loop = asyncio.get_running_loop()
-    for attempt in range(retries):
-        try:
-            # 放棄使用 session，改用 yf.download()，這在雲端環境通常更穩定
-            def download_data():
-                # 抓取過去 1 年的資料
-                data = yf.download(symbol, period="1y", progress=False)
-                return data
-
-            df = await loop.run_in_executor(None, download_data)
-            
-            if not df.empty and len(df) > 0:
-                # yf.download 回傳的欄位可能是 MultiIndex，我們需要稍微處理一下
-                if isinstance(df.columns, pd.MultiIndex):
-                    # 如果是多重索引，只取 Close 價格，並且確保欄位名稱正確
-                    close_series = df['Close'][symbol] if symbol in df['Close'] else df['Close']
-                    
-                    # 重新組裝出一個符合我們原本格式的 DataFrame
-                    new_df = pd.DataFrame(index=df.index)
-                    new_df['Close'] = close_series
-                    return symbol, new_df
-                else:
-                    return symbol, df
-        except Exception as e:
-            print(f"DEBUG: 抓取 {symbol} 失敗 (嘗試 {attempt+1}/{retries}): {e}")
-            
-        await asyncio.sleep(2) # 失敗的話等 2 秒再試
-    return symbol, pd.DataFrame()
-
-# ==========================================
-# 5. 專業圖表引擎
-# ==========================================
-def generate_advanced_chart(df, symbol):
-    plt.figure(figsize=(12, 8))
-    plt.rcParams['font.family'] = 'DejaVu Sans' # 美股不需要中文字體，用預設的即可
     
-    ax1 = plt.subplot(2, 1, 1)
-    ema200 = df['Close'].ewm(span=200, adjust=False).mean()
-    plt.plot(df.index, df['Close'], label='Price', color='blue', alpha=0.6)
-    plt.plot(df.index, ema200, label='200 EMA', color='red', linewidth=2)
-    plt.title(f"Wall Street Tech Analysis: {symbol}")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    def download_data():
+        temp_session = requests.Session()
+        temp_session.headers.update({"User-Agent": "Mozilla/5.0"})
+        # 抓取三種級別的資料
+        df_1h = yf.download(symbol, period="730d", interval="1h", progress=False, session=temp_session)
+        df_1d = yf.download(symbol, period="2y", interval="1d", progress=False, session=temp_session)
+        df_1wk = yf.download(symbol, period="5y", interval="1wk", progress=False, session=temp_session)
+        return df_1h, df_1d, df_1wk
 
-    ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+    for attempt in range(3):
+        try:
+            df_1h, df_1d, df_1wk = await loop.run_in_executor(None, download_data)
+            
+            # 處理 MultiIndex 問題 (確保能取出 Close, High, Low)
+            def clean_df(df):
+                if isinstance(df.columns, pd.MultiIndex):
+                    new_df = pd.DataFrame(index=df.index)
+                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                        if col in df.columns:
+                            new_df[col] = df[col][symbol] if symbol in df[col] else df[col]
+                    return new_df.dropna()
+                return df.dropna()
+
+            return clean_df(df_1h), clean_df(df_1d), clean_df(df_1wk)
+        except Exception as e:
+            await asyncio.sleep(2)
+            
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+# ==========================================
+# 5. 量化技術指標計算大腦 (包含 ATR 停損與 KD 隨機指標)
+# ==========================================
+def calculate_indicators(df):
+    if df.empty or len(df) < 200: return df
+    
+    # 均線系統 (20, 25, 50, 75, 140, 200)
+    df['EMA_14'] = df['Close'].ewm(span=14, adjust=False).mean()
+    df['MA_20'] = df['Close'].rolling(window=20).mean()
+    df['EMA_25'] = df['Close'].ewm(span=25, adjust=False).mean()
+    df['MA_50'] = df['Close'].rolling(window=50).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    df['EMA_75'] = df['Close'].ewm(span=75, adjust=False).mean()
+    df['EMA_140'] = df['Close'].ewm(span=140, adjust=False).mean()
+    df['EMA_200'] = df['Close'].ewm(span=200, adjust=False).mean()
+
+    # MACD (12, 26, 9)
     macd = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
     sig = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - sig
-    
-    plt.plot(df.index, macd, label='MACD', color='blue')
-    plt.plot(df.index, sig, label='Signal', color='orange')
-    plt.bar(df.index, hist, label='Histogram', color='gray', alpha=0.3)
-    plt.axhline(0, color='black', linewidth=1)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    df['MACD'] = macd
+    df['MACD_SIG'] = sig
+    df['MACD_HIST'] = macd - sig
 
-    chart_path = f"analysis_{symbol}.png"
-    plt.savefig(chart_path, bbox_inches='tight')
-    plt.close()
-    return chart_path
+    # RSI (一般 14日 與 75日中線趨勢)
+    delta = df['Close'].diff()
+    up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
+    df['RSI_14'] = 100 - (100 / (1 + up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()))
+    df['RSI_75'] = 100 - (100 / (1 + up.ewm(com=74, adjust=False).mean() / down.ewm(com=74, adjust=False).mean()))
+
+    # 隨機指標 Stochastic (14, 3, 3)
+    low_min = df['Low'].rolling(window=14).min()
+    high_max = df['High'].rolling(window=14).max()
+    k_fast = 100 * (df['Close'] - low_min) / (high_max - low_min)
+    df['STOCH_K'] = k_fast.rolling(window=3).mean()
+    df['STOCH_D'] = df['STOCH_K'].rolling(window=3).mean()
+
+    # ATR (Average True Range) - 用於計算動態停損
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['Close'].shift()).abs()
+    low_close = (df['Low'] - df['Close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR_14'] = tr.rolling(window=14).mean()
+
+    return df
 
 # ==========================================
-# 6. 單股分析與零股倉位健檢
+# 6. 單股多維度全息掃描 (短/中/長 期具體建議)
 # ==========================================
 async def process_stock_query(channel, symbol):
-    initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 進行美股策略分析與倉位精算...")
+    initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 啟動全息多維度掃描 (短/中/長級別 + ATR 風險計算)...")
     try:
-        _, df = await fetch_single_stock_data(symbol)
-        if df.empty or len(df) < 200:
-            await initial_msg.edit(content=f"❌ `{symbol}` 歷史數據不足或 API 無回應。")
+        df_1h, df_1d, df_1wk = await fetch_multi_timeframe_data(symbol)
+        
+        if df_1d.empty or len(df_1d) < 200:
+            await initial_msg.edit(content=f"❌ `{symbol}` 歷史數據不足，無法執行模塊計算。")
             return
             
-        p = load_portfolio()
-        cash = p.get("cash", 0.0)
-        holdings = p.get("holdings", {})
-            
-        close = df['Close']
-        ema200 = close.ewm(span=200, adjust=False).mean()
-        macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-        sig = macd.ewm(span=9, adjust=False).mean()
-        
-        curr_p = close.iloc[-1]
-        curr_ema200 = ema200.iloc[-1]
-        curr_macd = macd.iloc[-1]
-        curr_sig = sig.iloc[-1]
+        df_1h = calculate_indicators(df_1h)
+        df_1d = calculate_indicators(df_1d)
+        df_1wk = calculate_indicators(df_1wk)
 
-        trend = "上升趨勢" if curr_p > curr_ema200 else "下降趨勢"
-        is_long = (curr_p > curr_ema200) and (macd.iloc[-2] < sig.iloc[-2]) and (curr_macd > curr_sig) and (curr_macd < 0)
-        
-        chart_path = generate_advanced_chart(df, symbol)
-        
-        msg = (
-            f"📊 **{STOCK_NAMES.get(symbol, symbol)} ({symbol}) 策略報告**\n"
-            f"> 1. 【趨勢】：目前處於 **{trend}** (現價 `${curr_p:.2f}` vs 200 EMA `${curr_ema200:.2f}`)\n"
-            f"> 2. 【MACD】：快線 `{curr_macd:.2f}` / 慢線 `{curr_sig:.2f}`\n"
-            f"> 3. 【行動】：🚀 **{'強烈建議做多' if is_long else '未達進場標準，建議觀望'}**\n"
-        )
+        # 取得最新報價與 ATR
+        c_price = df_1d['Close'].iloc[-1]
+        atr = df_1d['ATR_14'].iloc[-1]
+        ema200 = df_1d['EMA_200'].iloc[-1]
 
-        msg += "\n💼 **【帳戶與零股健檢】**\n"
-        if symbol in holdings:
-            data_p = holdings[symbol]
-            shares = data_p["shares"]
-            avg_cost = data_p["avg_cost"]
-            profit_pct = ((curr_p - avg_cost) / avg_cost) * 100
-            msg += f"> 📦 持有：`{shares:.4f}` 股 | 均價 `${avg_cost:.2f}` | 報酬 **`{profit_pct:.1f}%`**\n"
-        else:
-            if is_long:
-                # 🌟 零股計算：計算到小數點後 4 位
-                max_shares = round(cash / curr_p, 4) if cash > 0 else 0
-                msg += f"> 💰 資金：可用現金 `${cash:.2f}`，最多可買入 **`{max_shares:.4f}` 股** (零股)。\n"
+        # 模塊 1：底層邏輯與趨勢過濾
+        trend_status = "🟢 長線多頭 (適合做多)" if c_price > ema200 else "🔴 長線空頭 (禁止做多，僅限做空)"
+        
+        # 模塊 2：短線 (1小時級別) - 14 & 50 EMA 共振 + MACD 零軸下金叉
+        h_macd, h_sig = df_1h['MACD'].iloc[-1], df_1h['MACD_SIG'].iloc[-1]
+        h_ema14, h_ema50 = df_1h['EMA_14'].iloc[-1], df_1h['EMA_50'].iloc[-1]
+        short_signal = "觀望"
+        if c_price > ema200 and (h_macd > h_sig) and (h_macd < 0) and (h_ema14 > h_ema50):
+            short_signal = "🚀【買入訊號】MACD 動能金叉且均線共振"
+        
+        # 模塊 3：中線波段 (日線級別) - 25/75/140 EMA + RSI + 隨機指標
+        d_ema25, d_ema75, d_ema140 = df_1d['EMA_25'].iloc[-1], df_1d['EMA_75'].iloc[-1], df_1d['EMA_140'].iloc[-1]
+        d_rsi75 = df_1d['RSI_75'].iloc[-1]
+        d_k, d_d = df_1d['STOCH_K'].iloc[-1], df_1d['STOCH_D'].iloc[-1]
+        mid_signal = "觀望"
+        if (d_ema25 > d_ema75 > d_ema140) and (d_rsi75 > 50):
+            if d_k > d_d and d_k < 30: # KD 在低檔交叉
+                mid_signal = "🎯【狙擊買點】價格回調完成，隨機指標超賣區金叉"
             else:
-                 msg += "> 📭 狀態：目前未持有此檔股票。\n"
+                mid_signal = "⏳【等待回調】多頭排列強勢，等待 KD 落入 20 以下"
 
-        await initial_msg.delete()
-        with open(chart_path, 'rb') as f:
-            await channel.send(content=msg, file=discord.File(f))
-        os.remove(chart_path)
+        # 模塊 4：長線跟蹤 (週線級別) - 20 MA 交叉 50 MA
+        w_ma20, w_ma50 = df_1wk['MA_20'].iloc[-1], df_1wk['MA_50'].iloc[-1]
+        long_signal = "觀望"
+        if w_ma20 > w_ma50:
+            long_signal = "📈【持股續抱】週線 20/50 多頭排列，吃到大趨勢"
+
+        # 模塊 5：風險管理計算 (停損與停利，盈虧比 1:2)
+        # 停損設在 140 EMA 或 1.5 倍 ATR 之下，取較低者保護
+        stop_loss = min(d_ema140, c_price - (1.5 * atr))
+        risk = c_price - stop_loss
+        target_price = c_price + (risk * 2) # 1:2 盈虧比
+
+        # 組合報告
+        msg = f"📊 **【{symbol} 華爾街多維度全息診斷報告】** 報價: `${c_price:.2f}`\n"
+        msg += f"🛡️ **模塊一 (大局趨勢)**: {trend_status} (200 EMA: `${ema200:.2f}`)\n"
+        msg += "----------------------------------------\n"
+        msg += f"⏱️ **短線策略 (1H)**: {short_signal}\n"
+        msg += f"📅 **中線策略 (Daily)**: {mid_signal}\n"
+        msg += f"🔭 **長線策略 (Weekly)**: {long_signal}\n"
+        msg += "----------------------------------------\n"
+        msg += f"⚖️ **模塊五 (風險管理與 ATR 動態計畫)**\n"
+        
+        if c_price > ema200:
+            msg += f"> 🛑 **強勢停損 (Stop Loss)**: 跌破 `${stop_loss:.2f}` 立即出場\n"
+            msg += f"> 🎯 **最小獲利目標 (Target)**: `${target_price:.2f}` (盈虧比 1:2)\n"
+            msg += f"> 💡 **動態出場**: 獲利後請以收盤價跌破 140 EMA (`${d_ema140:.2f}`) 作為防守。\n"
+        else:
+            msg += "> ⚠️ 目前處於長線空頭，系統拒絕給予做多計畫，建議空手等待。"
+
+        await initial_msg.edit(content=msg)
     except Exception as e:
-        await initial_msg.edit(content=f"❌ 系統錯誤！\n```python\n{traceback.format_exc()}\n```")
-
+        await initial_msg.edit(content=f"❌ 系統錯誤！無法生成多維度報告。")
+        print(e)
 # ==========================================
 # 7. 美股自動掃描引擎 (SPY 大盤 + 零股均分 + 全列表顯示)
 # ==========================================
