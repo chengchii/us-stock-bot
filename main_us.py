@@ -101,39 +101,86 @@ def save_portfolio(p):
 # ==========================================
 # 4. YFinance 數據引擎 (多時間級別版)
 # ==========================================
+# ==========================================
+# 4. YFinance 數據引擎 (極致防護版)
+# ==========================================
 import urllib.request
 
 async def fetch_multi_timeframe_data(symbol):
     loop = asyncio.get_running_loop()
     
-    def download_data():
+    # 將三種級別的下載分開，避免一個失敗拖垮全部
+    def download_1h():
         temp_session = requests.Session()
         temp_session.headers.update({"User-Agent": "Mozilla/5.0"})
-        # 抓取三種級別的資料
-        df_1h = yf.download(symbol, period="730d", interval="1h", progress=False, session=temp_session)
-        df_1d = yf.download(symbol, period="2y", interval="1d", progress=False, session=temp_session)
-        df_1wk = yf.download(symbol, period="5y", interval="1wk", progress=False, session=temp_session)
-        return df_1h, df_1d, df_1wk
+        # 1小時級別最多只能抓 730 天
+        return yf.download(symbol, period="720d", interval="1h", progress=False, session=temp_session)
+        
+    def download_1d():
+        temp_session = requests.Session()
+        temp_session.headers.update({"User-Agent": "Mozilla/5.0"})
+        return yf.download(symbol, period="2y", interval="1d", progress=False, session=temp_session)
+        
+    def download_1wk():
+        temp_session = requests.Session()
+        temp_session.headers.update({"User-Agent": "Mozilla/5.0"})
+        return yf.download(symbol, period="5y", interval="1wk", progress=False, session=temp_session)
 
+    # 處理 MultiIndex 並確保資料乾淨
+    def clean_df(df):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            new_df = pd.DataFrame(index=df.index)
+            # 確保欄位都有抓到，如果沒有就放 NaN
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in df.columns:
+                    # 處理 symbol 是否在第二層的問題
+                    if symbol in df[col]:
+                        new_df[col] = df[col][symbol]
+                    else:
+                        new_df[col] = df[col]
+            df = new_df
+        return df.dropna()
+
+    df_1h = pd.DataFrame()
+    df_1d = pd.DataFrame()
+    df_1wk = pd.DataFrame()
+
+    # 分別執行下載，容許部分失敗
     for attempt in range(3):
         try:
-            df_1h, df_1d, df_1wk = await loop.run_in_executor(None, download_data)
-            
-            # 處理 MultiIndex 問題 (確保能取出 Close, High, Low)
-            def clean_df(df):
-                if isinstance(df.columns, pd.MultiIndex):
-                    new_df = pd.DataFrame(index=df.index)
-                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                        if col in df.columns:
-                            new_df[col] = df[col][symbol] if symbol in df[col] else df[col]
-                    return new_df.dropna()
-                return df.dropna()
-
-            return clean_df(df_1h), clean_df(df_1d), clean_df(df_1wk)
+            if df_1d.empty:
+                raw_1d = await loop.run_in_executor(None, download_1d)
+                df_1d = clean_df(raw_1d)
+            if df_1h.empty:
+                raw_1h = await loop.run_in_executor(None, download_1h)
+                df_1h = clean_df(raw_1h)
+            if df_1wk.empty:
+                raw_1wk = await loop.run_in_executor(None, download_1wk)
+                df_1wk = clean_df(raw_1wk)
+                
+            # 如果最重要的日線抓到了，就可以跳出迴圈
+            if not df_1d.empty:
+                break
         except Exception as e:
+            print(f"抓取 {symbol} 資料時發生錯誤: {e}")
             await asyncio.sleep(2)
             
-    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    # --- ⚠️ 備用方案 (Fallback) ---
+    # 如果 1h 或 1wk 真的抓不到，為了不讓程式當機，我們用日線來「偽裝」填補
+    if not df_1d.empty:
+        if df_1h.empty:
+            print(f"⚠️ {symbol} 1小時資料抓取失敗，啟動備用防護。")
+            df_1h = df_1d.copy() # 用日線暫代，短線訊號可能失真，但不會當機
+        if df_1wk.empty:
+            print(f"⚠️ {symbol} 週線資料抓取失敗，使用日線重採樣。")
+            # 將日線資料轉換為週線格式
+            df_1wk = df_1d.resample('W').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
+            }).dropna()
+
+    return df_1h, df_1d, df_1wk
 
 # ==========================================
 # 5. 量化技術指標計算大腦 (包含 ATR 停損與 KD 隨機指標)
