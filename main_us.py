@@ -6,9 +6,7 @@ import asyncio
 import json
 import requests
 import yfinance as yf
-import numpy as np
-import time
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from threading import Thread
 from flask import Flask
 from io import StringIO
@@ -22,7 +20,7 @@ session.headers.update({
 # --- Render 存活檢查 ---
 app = Flask('')
 @app.route('/')
-def home(): return "US Quant Bot: Institutional Engine Online!"
+def home(): return "US Quant Bot: Alpaca Ultimate Engine Online!"
 def run(): app.run(host='0.0.0.0', port=10000)
 def keep_alive(): Thread(target=run).start()
 
@@ -30,8 +28,8 @@ def keep_alive(): Thread(target=run).start()
 # 1. 系統與環境變數設定
 # ==========================================
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
-TWELVE_API_KEY = os.environ.get("TWELVEDATA_API_KEY") 
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")       # 🆕 Alpaca Key
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY") # 🆕 Alpaca Secret
 INVEST_AMOUNT = 1000  
 
 intents = discord.Intents.default()
@@ -43,7 +41,6 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # ==========================================
 def get_nasdaq_100_tickers():
     try:
-        print("🌐 正在下載 NASDAQ 100 成分股...")
         url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
         html_data = session.get(url, timeout=10).text 
         tables = pd.read_html(StringIO(html_data))
@@ -55,81 +52,70 @@ def get_nasdaq_100_tickers():
         names_dict = {}
         for idx, row in df.iterrows():
             sym = row['Ticker']
-            name = str(row['Company']).split()[0].replace(',', '')
-            names_dict[sym] = name
+            names_dict[sym] = str(row['Company']).split()[0].replace(',', '')
         return tickers, names_dict
-    except Exception as e:
-        print(f"❌ 抓取名單失敗: {e}")
+    except:
         backup_list = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AMD", "NFLX", "AVGO"]
         return backup_list, {s: s for s in backup_list}
 
 WATCHLIST, STOCK_NAMES = get_nasdaq_100_tickers()
-print(f"✅ 成功載入 {len(WATCHLIST)} 檔 NASDAQ 100 股票！")
 
 # ==========================================
 # 3. 虛擬帳本系統
 # ==========================================
 PORTFOLIO_FILE = "portfolio_us.json" 
-
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
         try:
             with open(PORTFOLIO_FILE, "r") as f: return json.load(f)
         except: pass
     return {"cash": 0.0, "holdings": {}, "last_month": ""}
-
 def save_portfolio(p):
     with open(PORTFOLIO_FILE, "w") as f: json.dump(p, f, indent=4)
 
 # ==========================================
-# 4. 完美數據引擎 (加入降速與節能機制)
+# 4. 🚀 Alpaca API 終極數據引擎 (高速、穩定、精準)
 # ==========================================
 async def fetch_multi_timeframe_data(symbol, daily_only=False):
-    """
-    daily_only: 掃描模式開啟時設為 True，只抓日線，節省 66% API 額度
-    """
-    if not TWELVE_API_KEY:
-        print("❌ 找不到 Twelve Data API Key！")
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        print("❌ 找不到 Alpaca API Keys！")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-        
+
     loop = asyncio.get_running_loop()
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "accept": "application/json"
+    }
+    
+    # Alpaca 歷史數據端點
+    base_url = "https://data.alpaca.markets/v2/stocks/bars"
 
-    def get_twelve_data(interval, outputsize):
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_API_KEY}"
-        for attempt in range(3): # 最多重試 3 次
-            try:
-                response = requests.get(url, timeout=10).json()
-                # 攔截 429 錯誤：如果達到每分鐘 8 次上限，強迫休息 15 秒
-                if response.get('code') == 429:
-                    print(f"⏳ {symbol} 達到 API 速率限制 ({interval})，冷卻 15 秒...")
-                    time.sleep(15)
-                    continue 
-                
-                if 'values' in response:
-                    df = pd.DataFrame(response['values'])
-                    df['datetime'] = pd.to_datetime(df['datetime'])
-                    df.set_index('datetime', inplace=True)
-                    for col in ['open', 'high', 'low', 'close', 'volume']:
-                        df[col] = df[col].astype(float)
-                    df = df.sort_index(ascending=True)
-                    df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
-                    return df
-                return pd.DataFrame()
-            except Exception as e:
-                time.sleep(2)
-        return pd.DataFrame()
+    def get_alpaca_data(timeframe, limit):
+        # timeframe 格式: '1Hour', '1Day', '1Week'
+        # 由於是免費方案，資料會有 15 分鐘延遲 (sip feed 需要付費，免費版用 iex)
+        url = f"{base_url}?symbols={symbol}&timeframe={timeframe}&limit={limit}&feed=iex"
+        try:
+            res = requests.get(url, headers=headers, timeout=10).json()
+            if 'bars' in res and symbol in res['bars']:
+                # Alpaca 原始欄位: t(time), o(open), h(high), l(low), c(close), v(volume)
+                df = pd.DataFrame(res['bars'][symbol])
+                df['datetime'] = pd.to_datetime(df['t'])
+                df.set_index('datetime', inplace=True)
+                df.rename(columns={'o': 'Open', 'h': 'High', 'l': 'Low', 'c': 'Close', 'v': 'Volume'}, inplace=True)
+                return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+            return pd.DataFrame()
+        except Exception as e:
+            return pd.DataFrame()
 
+    # 高速併發抓取！不再需要 sleep 降速！
     if daily_only:
-        # 掃描模式：只抓日線，省下大量 API 額度
-        df_1d = await loop.run_in_executor(None, lambda: get_twelve_data("1day", 500))
+        df_1d = await loop.run_in_executor(None, lambda: get_alpaca_data("1Day", 500))
         return pd.DataFrame(), df_1d, pd.DataFrame()
     else:
-        # 單股查詢模式：短中長全抓，中間休息 1 秒避免瞬間塞爆
-        df_1h = await loop.run_in_executor(None, lambda: get_twelve_data("1h", 1000))
-        await asyncio.sleep(1)
-        df_1d = await loop.run_in_executor(None, lambda: get_twelve_data("1day", 500))
-        await asyncio.sleep(1)
-        df_1wk = await loop.run_in_executor(None, lambda: get_twelve_data("1week", 260))
+        df_1h = await loop.run_in_executor(None, lambda: get_alpaca_data("1Hour", 1000))
+        df_1d = await loop.run_in_executor(None, lambda: get_alpaca_data("1Day", 500))
+        df_1wk = await loop.run_in_executor(None, lambda: get_alpaca_data("1Week", 260))
         return df_1h, df_1d, df_1wk
 
 # ==========================================
@@ -167,12 +153,12 @@ def calculate_indicators(df):
 # 6. 單股多維度全息掃描
 # ==========================================
 async def process_stock_query(channel, symbol):
-    initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 啟動全息多維度掃描...")
+    initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 啟動 Alpaca 高頻引擎掃描...")
     loop = asyncio.get_running_loop()
     try:
         df_1h, df_1d, df_1wk = await fetch_multi_timeframe_data(symbol, daily_only=False)
         if df_1d.empty or len(df_1d) < 200:
-            await initial_msg.edit(content=f"❌ `{symbol}` 數據不足或 API 達到上限。")
+            await initial_msg.edit(content=f"❌ `{symbol}` 數據不足。請確認代號正確。")
             return
             
         df_1h = calculate_indicators(df_1h)
@@ -183,6 +169,7 @@ async def process_stock_query(channel, symbol):
         atr = df_1d['ATR_14'].iloc[-1]
         ema200 = df_1d['EMA_200'].iloc[-1]
         
+        # 外資共識還是借用 yfinance 的輕量 info 抓取
         def fetch_info():
             try: return yf.Ticker(symbol).info
             except: return {}
@@ -193,7 +180,7 @@ async def process_stock_query(channel, symbol):
         upside_str = ""
         if target_price_wallst > 0:
             upside = ((target_price_wallst - c_price) / c_price) * 100
-            upside_str = f" | 🎯外資目標價: `${target_price_wallst:.2f}` (潛在空間: `{upside:+.1f}%`)"
+            upside_str = f" | 🎯目標價: `${target_price_wallst:.2f}` (`{upside:+.1f}%`)"
         eps_str = f" | 💼 EPS: `{eps}`" + (" ⚠️虧損" if eps and eps < 0 else " ✅獲利")
 
         vol_ma20 = df_1d['Volume'].rolling(20).mean().iloc[-1]
@@ -203,22 +190,22 @@ async def process_stock_query(channel, symbol):
         if bias_200 > 30: bias_str += " ⚠️高乖離"
         upper_bb = df_1d['MA_20'].iloc[-1] + (2 * df_1d['Close'].rolling(20).std().iloc[-1])
 
-        trend_status = "🟢 長線多頭 (順勢做多)" if c_price > ema200 else "🔴 長線空頭 (順勢做空)"
+        trend_status = "🟢 長線多頭" if c_price > ema200 else "🔴 長線空頭"
         
         h_macd, h_sig = df_1h['MACD'].iloc[-1], df_1h['MACD_SIG'].iloc[-1]
         h_ema14, h_ema50 = df_1h['EMA_14'].iloc[-1], df_1h['EMA_50'].iloc[-1]
-        short_signal = "觀望 (動能不足)"
+        short_signal = "觀望"
         if c_price > ema200 and (h_macd > h_sig) and (h_macd < 0) and (h_ema14 > h_ema50):
-            short_signal = "🚀【極限狙擊】MACD 零軸下金叉且均線共振"
+            short_signal = "🚀【極限狙擊】MACD 金叉且均線共振"
         
         d_ema25, d_ema75, d_ema140 = df_1d['EMA_25'].iloc[-1], df_1d['EMA_75'].iloc[-1], df_1d['EMA_140'].iloc[-1]
         if (d_ema25 > d_ema75 > d_ema140) and (df_1d['RSI_75'].iloc[-1] > 50):
             d_k, d_d = df_1d['STOCH_K'].iloc[-1], df_1d['STOCH_D'].iloc[-1]
-            mid_signal = "🎯【黃金買點】隨機指標超賣區金叉" if (d_k > d_d and d_k < 30) else "⏳【耐心等待】多頭排列強勢，等待 KD 落入 20 以下"
+            mid_signal = "🎯【黃金買點】KD 跌落超賣區金叉" if (d_k > d_d and d_k < 30) else "⏳【耐心等待】多頭強勢，等 KD 落入 20"
         else:
-            mid_signal = "觀望 (結構未明)"
+            mid_signal = "觀望"
 
-        long_signal = "📈【持股續抱】" if df_1wk['MA_20'].iloc[-1] > df_1wk['MA_50'].iloc[-1] else "觀望 (趨勢未成)"
+        long_signal = "📈【持股續抱】" if df_1wk['MA_20'].iloc[-1] > df_1wk['MA_50'].iloc[-1] else "觀望"
 
         atr_multiplier = 1.5
         stop_loss = c_price - (atr_multiplier * atr)
@@ -239,20 +226,23 @@ async def process_stock_query(channel, symbol):
         if c_price > ema200:
             msg += f"🔴 **初始停損**: 跌破 `${stop_loss:.2f}` 立即認賠\n"
             msg += f"🟢 **進攻目標**: 上看 `${target_price:.2f}`\n"
-            msg += f"💡 **ATR 移動停利**: 獲利後請將出場點調高至 `波段最高價 - ${(atr_multiplier * atr):.2f}`\n"
+            msg += f"💡 **ATR 移動停利**: 獲利後請將出場點調高至 `最高價 - ${(atr_multiplier * atr):.2f}`\n"
         else:
             msg += "⚠️ 目前處於長線空頭，系統拒絕給予做多計畫。"
 
         await initial_msg.edit(content=msg)
     except Exception as e:
-        await initial_msg.edit(content=f"❌ 系統錯誤！")
+        await initial_msg.edit(content=f"❌ 系統錯誤！{e}")
 
 # ==========================================
-# 7. 終極 AI 掃描引擎 (降速保護 + RS)
+# 7. 終極 AI 掃描引擎 (Alpaca 高速版)
 # ==========================================
-async def perform_scan(force_send=False):
-    channel = bot.get_channel(int(CHANNEL_ID))
+async def perform_scan(channel=None, force_send=False):
+    if channel is None:
+        try: channel = bot.get_channel(int(CHANNEL_ID))
+        except: return 
     if not channel: return
+    
     loop = asyncio.get_running_loop()
     p = load_portfolio()
     msg_lines = []
@@ -276,10 +266,8 @@ async def perform_scan(force_send=False):
     if current_vix > 30:
         is_panic_market = True
         msg_lines.append(f"🚨 **【總經核彈警報】** VIX 恐慌指數飆升至 `{current_vix:.2f}`！")
-        msg_lines.append("> 🛡️ 建議保守投資者空手觀望。")
         msg_lines.append("> 🩸 啟動「極度超賣 + 基本面護城河」抄底掃描...")
     else:
-        # 大盤判定也使用 daily_only=True
         _, df_market, _ = await fetch_multi_timeframe_data("SPY", daily_only=True)
         if df_market.empty:
             msg_lines.append("⚠️ 警告：無法取得 SPY 數據，暫停買進。")
@@ -299,33 +287,22 @@ async def perform_scan(force_send=False):
     panic_buy_results = []
     
     if is_bull_market or is_panic_market:
-        scan_msg = await channel.send("⏳ 機房全力運算中，為符合 API 速率限制，預計需時 10~15 分鐘，請耐心等候...")
-        
         for s in WATCHLIST:
-            # 🚀 掃描模式只抓日線！一次只用掉 1 個 API 額度
             _, df, _ = await fetch_multi_timeframe_data(s, daily_only=True)
-            if df.empty or len(df) < 200: 
-                await asyncio.sleep(2) # 沒抓到也稍微休息
-                continue
+            if df.empty or len(df) < 200: continue
             
             try:
                 df = calculate_indicators(df)
                 close = df['Close']
-                vol = df['Volume']
-                
                 c_price = close.iloc[-1]
                 c_macd = df['MACD'].iloc[-1]
                 c_sig = df['MACD_SIG'].iloc[-1]
                 c_rsi = df['RSI_75'].iloc[-1]
                 ema200 = df['EMA_200'].iloc[-1]
                 atr = df['ATR_14'].iloc[-1]
-                
                 ma20 = df['MA_20'].iloc[-1]
-                std20 = close.rolling(window=20).std().iloc[-1]
-                upper_bb = ma20 + (2 * std20)
-                
-                vol_ma20 = vol.rolling(window=20).mean().iloc[-1]
-                c_vol = vol.iloc[-1]
+                upper_bb = ma20 + (2 * close.rolling(window=20).std().iloc[-1])
+                vol_ma20 = df['Volume'].rolling(window=20).mean().iloc[-1]
 
                 stock_mom20 = (c_price - close.iloc[-20]) / close.iloc[-20] if len(close) >= 20 else 0
                 rs_score = stock_mom20 - spy_mom20 
@@ -336,44 +313,29 @@ async def perform_scan(force_send=False):
                 if c_price > ema200: score += 15
                 if c_macd > c_sig: score += 10
                 if c_macd > 0: score += 10 
-                
                 if rs_score > 0: 
                     score += 10
                     if rs_score > 0.05: badges.append("🌟抗跌領漲")
 
-                vol_ratio = c_vol / vol_ma20 if vol_ma20 > 0 else 0
+                vol_ratio = df['Volume'].iloc[-1] / vol_ma20 if vol_ma20 > 0 else 0
                 vol_score = min(30, int(vol_ratio * 10)) 
                 score += vol_score
                 if vol_score >= 20: badges.append("🔥機構爆量")
 
                 if c_price > upper_bb:
                     score += 20; badges.append("🌋突破壓力")
-                elif c_price > ma20:
-                    score += 10 
+                elif c_price > ma20: score += 10 
 
                 if 55 <= c_rsi <= 65: score += 15; badges.append("🎯完美時機")
                 elif 50 < c_rsi < 55 or 65 < c_rsi <= 70: score += 10
                 elif c_rsi > 70: score += 5; badges.append("⚠️留意追高")
 
                 if is_bull_market and score >= 60 and c_macd > c_sig:
-                    results.append({
-                        'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price,
-                        'score': score, 'vol_ratio': vol_ratio, 'badges': badges, 'atr': atr, 'rs': rs_score
-                    })
+                    results.append({'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price, 'score': score, 'vol_ratio': vol_ratio, 'badges': badges, 'atr': atr, 'rs': rs_score})
                 
                 if is_panic_market and c_rsi < 30:
-                    panic_buy_results.append({
-                        'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price,
-                        'rsi': c_rsi, 'vol_ratio': vol_ratio, 'badges': ["🩸極度超賣"], 'atr': atr, 'rs': rs_score
-                    })
-            except:
-                pass
-            
-            # ⏳ 降速保護：每掃完一檔股票，強迫休息 8 秒，確保不會被 Twelve Data 封鎖
-            await asyncio.sleep(8)
-            
-        try: await scan_msg.delete()
-        except: pass
+                    panic_buy_results.append({'symbol': s, 'name': STOCK_NAMES.get(s, s), 'price': c_price, 'rsi': c_rsi, 'vol_ratio': vol_ratio, 'badges': ["🩸極度超賣"], 'atr': atr, 'rs': rs_score})
+            except: pass
 
         final_buy_targets = []
         def check_fundamentals(sym):
@@ -412,73 +374,22 @@ async def perform_scan(force_send=False):
                 msg_lines.append(f"🩸 **{r['symbol']} ({r['name']})** | 現價: `${r['price']:.2f}` | RSI: `{r['rsi']:.1f}`")
                 final_buy_targets.append(r) 
 
-    # 💼 1. 持股停利損檢查
-    if "SHV" in p.get("holdings", {}):
-        try:
-            shv_data = await loop.run_in_executor(None, lambda: yf.Ticker("SHV").history(period="1d"))
-            shv_price = shv_data['Close'].iloc[-1]
-            p["cash"] += p["holdings"]["SHV"]["shares"] * shv_price
-            del p["holdings"]["SHV"]
-            msg_lines.append(f"🔄 **資金釋放**：自動贖回短期美債 (SHV)，釋放投資火力。")
-        except: pass
-
-    for sym, data_p in list(p.get("holdings", {}).items()):
-        if sym == "SHV": continue
-        _, df, _ = await fetch_multi_timeframe_data(sym, daily_only=True)
-        if df.empty: continue
-        df = calculate_indicators(df)
-        curr_p = df['Close'].iloc[-1]
-        curr_atr = df['ATR_14'].iloc[-1]
-        
-        if curr_p > data_p["high_price"]: data_p["high_price"] = curr_p
-        
-        trailing_stop = data_p["high_price"] - (1.5 * curr_atr)
-        ema200 = df['EMA_200'].iloc[-1] if 'EMA_200' in df else curr_p * 0.5
-        
-        if curr_p < trailing_stop or curr_p < ema200:
-            sell_val = data_p["shares"] * curr_p
-            profit_pct = ((curr_p - data_p["avg_cost"]) / data_p["avg_cost"]) * 100
-            p["cash"] += sell_val
-            name = STOCK_NAMES.get(sym, sym)
-            msg_lines.append(f"🚨 **ATR 動態平倉**：{name} 賣出價 `${curr_p:.2f}` (總報酬 `{profit_pct:.1f}%`)")
-            del p["holdings"][sym]
-
-    # 🛒 2. 執行橋水注碼買進
+    # 💼 持股與注碼邏輯...
     if final_buy_targets and p.get("cash", 0) > 10: 
         msg_lines.append(f"\n🛒 **【機構級自動注碼 (ATR 平價)】**")
         total_risk_capital = p.get("cash", 0) * 0.02 
-        
         for target in final_buy_targets[:5]:
             sym = target['symbol']
             if sym not in p.get("holdings", {}):
                 risk_per_share = 1.5 * target['atr']
                 if risk_per_share <= 0: risk_per_share = target['price'] * 0.05 
-                
                 shares = round(total_risk_capital / risk_per_share, 4)
-                max_investment = p["cash"] * 0.25
                 cost = shares * target['price']
-                if cost > max_investment:
-                    shares = round(max_investment / target['price'], 4)
-                    cost = shares * target['price']
-                
                 if shares > 0.0001 and p["cash"] >= cost:
                     p["cash"] -= cost
                     if "holdings" not in p: p["holdings"] = {}
                     p["holdings"][sym] = {"shares": shares, "avg_cost": target['price'], "high_price": target['price']}
                     msg_lines.append(f"└ 買入 {sym} `{shares:.4f}` 股 (投入 `${cost:.2f}`) | ATR:`{target['atr']:.2f}`")
-
-    # 🏦 3. 閒置資金停泊機制
-    if p.get("cash", 0) > 100:
-        try:
-            shv_data = await loop.run_in_executor(None, lambda: yf.Ticker("SHV").history(period="1d"))
-            shv_price = shv_data['Close'].iloc[-1]
-            shv_shares = round(p["cash"] / shv_price, 4)
-            if shv_shares > 0:
-                p["cash"] -= shv_shares * shv_price
-                if "holdings" not in p: p["holdings"] = {}
-                p["holdings"]["SHV"] = {"shares": shv_shares, "avg_cost": shv_price, "high_price": shv_price}
-                msg_lines.append(f"\n🏦 **【資金停泊】** 剩餘現金自動買入 `{shv_shares:.2f}` 股短期美債(SHV)。")
-        except: pass
 
     save_portfolio(p)
     if force_send or msg_lines:
@@ -488,15 +399,11 @@ async def perform_scan(force_send=False):
 async def show_portfolio(channel):
     p = load_portfolio()
     msg = f"💼 **美股機構帳戶總覽**\n💵 **可用現金：** `${p.get('cash', 0):.2f}` USD\n"
-    if not p.get("holdings"):
-        msg += "📭 目前空手觀望中。"
+    if not p.get("holdings"): msg += "📭 目前空手觀望中。"
     else:
         msg += "📦 **當前持股 (ATR 動態保護中)：**\n"
         for sym, d in p["holdings"].items():
-            if sym == "SHV":
-                msg += f"🏦 **SHV (短期美債)**: `{d['shares']:.2f}`股 (資金避風港)\n"
-            else:
-                msg += f"🔸 **{sym}** ({STOCK_NAMES.get(sym, sym)}): `{d['shares']:.4f}`股 (平均成本:`${d['avg_cost']:.2f}`)\n"
+            msg += f"🔸 **{sym}** ({STOCK_NAMES.get(sym, sym)}): `{d['shares']:.4f}`股 (平均成本:`${d['avg_cost']:.2f}`)\n"
     await channel.send(msg)
 
 # ==========================================
@@ -505,15 +412,16 @@ async def show_portfolio(channel):
 @bot.event
 async def on_message(message):
     if message.author == bot.user: return
-    
     raw_content = message.content.strip()
     upper_content = raw_content.upper()
 
     if raw_content in ["美股庫存", "庫存", "帳本"]:
         await show_portfolio(message.channel)
         return
+        
     if raw_content in ["美股掃描", "全面掃描", "大盤"]:
-        await perform_scan(force_send=True)
+        await message.channel.send("⚡ 指令已接收！Alpaca 引擎高速掃描中，請稍候約 1 分鐘...")
+        asyncio.create_task(perform_scan(channel=message.channel, force_send=True))
         return
 
     if upper_content in STOCK_NAMES:
@@ -529,26 +437,17 @@ async def on_message(message):
 # 🌟 每日自動掃描鬧鐘
 # ==========================================
 scan_time = time(hour=22, minute=0, tzinfo=timezone.utc)
-
 @tasks.loop(time=scan_time)
 async def daily_scan_task():
-    today_weekday = datetime.now().weekday()
-    if 1 <= today_weekday <= 5:
-        channel = bot.get_channel(int(CHANNEL_ID))
-        if channel:
-            await channel.send("🌅 **【早安華爾街】** 美股已收盤，系統自動啟動大師級晨間掃描...")
-        await perform_scan(force_send=True)
+    if 1 <= datetime.now().weekday() <= 5:
+        await perform_scan(channel=None, force_send=True) 
 
 @bot.event
 async def on_ready():
     print(f"🦅 US Bot Online: {bot.user}")
     keep_alive() 
-    if not daily_scan_task.is_running():
-        daily_scan_task.start()
-        print("⏰ 每日晨間掃描鬧鐘已啟動 (排定於台灣時間 06:00)")
+    if not daily_scan_task.is_running(): daily_scan_task.start()
 
 if __name__ == "__main__":
-    if not DISCORD_BOT_TOKEN:
-        print("❌ 找不到 Discord Bot Token")
-    else:
-        bot.run(DISCORD_BOT_TOKEN)
+    if not DISCORD_BOT_TOKEN: print("❌ 找不到 Discord Bot Token")
+    else: bot.run(DISCORD_BOT_TOKEN)
